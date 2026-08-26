@@ -5,12 +5,22 @@
 //   1. parses the product SKU from the filename,
 //   2. finds the M.PCM.Product by SKU (FullText search + exact SKU verify),
 //   3. (real run) uploads the image to create an M.Asset,
-//   4. (real run) links the new asset to the product via PCMProductToAsset.
+//   4. (real run) links the new asset to the product:
+//        • always adds it to PCMProductToAllAssets (all assets of the product),
+//        • if the product has NO master/cover yet, also sets it as the single
+//          PCMProductToMasterAsset (cover image). Only the first asset per
+//          product becomes the cover; the rest are all-assets only.
 //
 // Two buttons:
 //   • Validate (dry run) — reads the zip, resolves each SKU to a product, and
 //     reports matches/misses. NO writes to Content Hub.
 //   • Upload & link — does the real uploads + relations for matched images.
+//
+// Results view is built for large batches (100s of images):
+//   • summary counts at the top (matched / not found / ambiguous / error),
+//   • a filter (All · Problems only · Matched only) + filename/SKU search,
+//   • "Download results" exports the full per-image outcome as an Excel file,
+//   so you never have to scroll a long log to find the misses.
 //
 // Uses the authenticated SDK client the External Component receives
 // (context.client). The upload call (client.uploads.uploadAsync) is the one
@@ -18,8 +28,10 @@
 //
 // Configuration (JSON), optional:
 //   {
-//     "skuSeparator": "_",              // SKU = filename stem before this (blank = whole stem)
-//     "relationName": "PCMProductToAsset",
+//     "skuSeparator": "_",                       // SKU = filename stem before this (blank = whole stem)
+//     "allAssetsRelation": "PCMProductToAllAssets",
+//     "masterAssetRelation": "PCMProductToMasterAsset",
+//     "setMasterIfEmpty": true,                  // set cover only when product has none
 //     "uploadConfiguration": "AssetUploadConfiguration",
 //     "uploadAction": "NewAsset"
 //   }
@@ -27,17 +39,20 @@
 
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
 
 const DEFAULTS = {
   skuSeparator: '',
-  relationName: 'PCMProductToAsset',
+  allAssetsRelation: 'PCMProductToAllAssets',
+  masterAssetRelation: 'PCMProductToMasterAsset',
+  setMasterIfEmpty: true,
   uploadConfiguration: 'AssetUploadConfiguration',
   uploadAction: 'NewAsset'
 };
 const IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'svg', 'heic', 'heif']);
 
 const CSS = `
-  .a-wrap  { font-family: "Segoe UI", sans-serif; padding: 24px; max-width: 900px; }
+  .a-wrap  { font-family: "Segoe UI", sans-serif; padding: 24px; max-width: 960px; }
   .a-title { font-size: 20px; font-weight: 600; margin-bottom: 2px; }
   .a-sub   { font-size: 13px; color: #555; margin-bottom: 18px; }
   .a-drop  { border: 2px dashed #aaa; border-radius: 8px; padding: 32px; text-align: center; cursor: pointer; color: #555; margin-bottom: 12px; }
@@ -47,7 +62,33 @@ const CSS = `
   .a-btn:disabled { opacity: .5; cursor: not-allowed; }
   .a-dry   { background: #edf2f7; color: #2d3748; }
   .a-go    { background: #c53030; color: #fff; }
-  .a-log   { background: #1a202c; color: #e2e8f0; font-family: monospace; font-size: 12px; padding: 14px; border-radius: 6px; margin-top: 14px; max-height: 380px; overflow: auto; white-space: pre-wrap; display: none; }
+  .a-note  { font-size: 12px; color: #718096; }
+
+  .a-chips { display: none; gap: 8px; flex-wrap: wrap; margin: 4px 0 12px; }
+  .a-chip  { font-size: 12px; font-weight: 600; padding: 5px 11px; border-radius: 999px; }
+  .a-chip.total { background: #edf2f7; color: #2d3748; }
+  .a-chip.ok    { background: #c6f6d5; color: #22543d; }
+  .a-chip.miss  { background: #fed7d7; color: #742a2a; }
+  .a-chip.amb   { background: #feebc8; color: #7b341e; }
+  .a-chip.err   { background: #fbb6ce; color: #702459; }
+
+  .a-tools { display: none; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  .a-tools select, .a-tools input { padding: 6px 8px; font-size: 13px; border: 1px solid #cbd5e0; border-radius: 6px; }
+  .a-tools input { min-width: 220px; }
+  .a-shown { font-size: 12px; color: #718096; }
+
+  .a-results { display: none; border: 1px solid #e2e8f0; border-radius: 8px; max-height: 460px; overflow: auto; margin-bottom: 12px; }
+  .a-results table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  .a-results th { position: sticky; top: 0; background: #f7fafc; text-align: left; padding: 8px 10px; border-bottom: 1px solid #e2e8f0; font-weight: 600; color: #4a5568; }
+  .a-results td { padding: 7px 10px; border-bottom: 1px solid #edf2f7; vertical-align: top; }
+  .a-results tr.ok   td:first-child { color: #2f855a; }
+  .a-results tr.bad  td:first-child { color: #c53030; }
+  .a-results tr.bad  { background: #fff5f5; }
+  .a-results .fn  { font-family: monospace; }
+  .a-results .msg { color: #718096; }
+  .a-results .bad .msg { color: #c53030; font-weight: 600; }
+
+  .a-log   { background: #1a202c; color: #e2e8f0; font-family: monospace; font-size: 12px; padding: 12px 14px; border-radius: 6px; margin-top: 4px; max-height: 200px; overflow: auto; white-space: pre-wrap; display: none; }
   .a-ok { color: #68d391; } .a-skip { color: #cbd5e0; } .a-err { color: #fc8181; } .a-info { color: #90cdf4; }
 `;
 
@@ -65,6 +106,13 @@ function loadScript(url, globalName) {
 function baseName(p) { return String(p || '').split('/').pop().split('\\').pop(); }
 function stripExt(n) { const i = n.lastIndexOf('.'); return i > 0 ? n.slice(0, i) : n; }
 function extOf(n) { const i = n.lastIndexOf('.'); return i >= 0 ? n.slice(i + 1).toLowerCase() : ''; }
+function ts() { const d = new Date(), p = n => String(n).padStart(2, '0'); return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`; }
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
 
 function readProp(item, name) {
   const p = item && item.properties ? item.properties[name] : undefined;
@@ -103,15 +151,32 @@ export default function createExternalRoot(rootElement) {
       wrap.innerHTML = `
         <div class="a-title">🖼️ Asset Uploader + Linker</div>
         <div class="a-sub">Upload a <b>.zip</b> of images named by product SKU. Validate first to confirm each
-          SKU resolves to a product, then Upload &amp; link to create each M.Asset and attach it to its product
-          via <code>${cfg.relationName}</code>.</div>
+          SKU resolves to a product, then Upload &amp; link to create each M.Asset, add it to
+          <code>${cfg.allAssetsRelation}</code>, and — if the product has no cover yet — set it as the
+          <code>${cfg.masterAssetRelation}</code> (cover).</div>
         <div class="a-drop" id="a-drop">📦 Drop your .zip here, or click to browse</div>
         <input type="file" id="a-file" accept=".zip,application/zip" style="display:none" />
         <div class="a-row">
           <button class="a-btn a-dry" id="a-dry" disabled>🔍 Validate (dry run)</button>
           <button class="a-btn a-go"  id="a-go"  disabled>⬆ Upload &amp; link (writes to Content Hub)</button>
-          <span id="a-status" style="font-size:13px;color:#555"></span>
+          <span id="a-status" class="a-note"></span>
         </div>
+
+        <div class="a-chips" id="a-chips"></div>
+        <div class="a-tools" id="a-tools">
+          <label class="a-note">Show
+            <select id="a-filter">
+              <option value="all">All</option>
+              <option value="problems">Problems only</option>
+              <option value="matched">Matched only</option>
+            </select>
+          </label>
+          <input id="a-search" type="text" placeholder="filter by filename or SKU…" />
+          <button class="a-btn a-dry" id="a-dl">⬇ Download results</button>
+          <span class="a-shown" id="a-shown"></span>
+        </div>
+        <div class="a-results" id="a-results"></div>
+
         <div class="a-log" id="a-log"></div>
       `;
       rootElement.innerHTML = ''; rootElement.appendChild(style); rootElement.appendChild(wrap);
@@ -119,15 +184,26 @@ export default function createExternalRoot(rootElement) {
       const drop = wrap.querySelector('#a-drop'), input = wrap.querySelector('#a-file');
       const dryBtn = wrap.querySelector('#a-dry'), goBtn = wrap.querySelector('#a-go');
       const status = wrap.querySelector('#a-status'), logEl = wrap.querySelector('#a-log');
+      const chipsEl = wrap.querySelector('#a-chips'), toolsEl = wrap.querySelector('#a-tools');
+      const resultsEl = wrap.querySelector('#a-results'), shownEl = wrap.querySelector('#a-shown');
+      const filterEl = wrap.querySelector('#a-filter'), searchEl = wrap.querySelector('#a-search');
+      const dlBtn = wrap.querySelector('#a-dl');
       let currentFile = null;
+      let results = [];       // [{ name, sku, ok, statusLabel, productId, productName, message }]
+      let lastMode = 'dry';
 
       function log(msg, cls) {
         logEl.style.display = 'block';
         const line = document.createElement('div'); if (cls) line.className = cls;
         line.textContent = msg; logEl.appendChild(line); logEl.scrollTop = logEl.scrollHeight;
       }
-      function clearLog() { logEl.innerHTML = ''; logEl.style.display = 'none'; }
-      function onFile(f) { if (!f) return; clearLog(); currentFile = f; status.textContent = `${f.name} — ready`; dryBtn.disabled = false; goBtn.disabled = false; }
+      function clearAll() {
+        logEl.innerHTML = ''; logEl.style.display = 'none';
+        results = []; resultsEl.style.display = 'none'; resultsEl.innerHTML = '';
+        chipsEl.style.display = 'none'; chipsEl.innerHTML = '';
+        toolsEl.style.display = 'none'; shownEl.textContent = '';
+      }
+      function onFile(f) { if (!f) return; clearAll(); currentFile = f; status.textContent = `${f.name} — ready`; dryBtn.disabled = false; goBtn.disabled = false; }
 
       drop.addEventListener('click', () => input.click());
       input.addEventListener('change', e => onFile(e.target.files[0]));
@@ -166,68 +242,172 @@ export default function createExternalRoot(rootElement) {
           fileName: img.name
         };
         const result = await client.uploads.uploadAsync(request);
-        // Try to read the created asset id from a few likely shapes.
         const aid = (result && (result.assetId || result.entityId || result.id ||
           (result.entity && result.entity.id))) || null;
         if (aid == null) throw new Error('upload returned no asset id (shape: ' + JSON.stringify(result).slice(0, 200) + ')');
         return aid;
       }
 
-      // Link asset -> product via the PCMProductToAsset relation (product is parent).
+      // Read the ids currently in a relation, across possible SDK shapes.
+      function relGetIds(rel) {
+        if (!rel) return [];
+        if (typeof rel.getIds === 'function') { try { const v = rel.getIds(); if (Array.isArray(v)) return v; } catch (e) { /* ignore */ } }
+        if (Array.isArray(rel.children)) return rel.children.slice();
+        if (Array.isArray(rel.ids)) return rel.ids.slice();
+        return [];
+      }
+      function relAdd(rel, id) {
+        if (typeof rel.add === 'function') { rel.add(id); return; }
+        if (Array.isArray(rel.children)) { rel.children.push(id); return; }
+        if (typeof rel.setIds === 'function') { rel.setIds([...relGetIds(rel), id]); return; }
+        throw new Error('could not add id to relation (unknown relation API)');
+      }
+
+      // Link asset -> product. Always add to the all-assets relation; if the
+      // product has no master/cover yet, also set this asset as the cover.
+      // Returns { master: true } when the asset was set as the cover.
       async function linkAssetToProduct(assetId, productId) {
         const product = await client.entities.getAsync(productId);
-        const rel = product.getRelation(cfg.relationName);
-        if (!rel) throw new Error(`relation ${cfg.relationName} not found on product`);
-        // Add the asset id to the relation's children (product is the parent side).
-        if (typeof rel.add === 'function') rel.add(assetId);
-        else if (Array.isArray(rel.children)) rel.children.push(assetId);
-        else if (typeof rel.setIds === 'function') rel.setIds([...(rel.getIds ? rel.getIds() : []), assetId]);
-        else throw new Error('could not add id to relation (unknown relation API)');
+
+        // 1) all-assets (product is parent, asset is child) — skip if already present
+        const all = product.getRelation(cfg.allAssetsRelation);
+        if (!all) throw new Error(`relation ${cfg.allAssetsRelation} not found on product`);
+        if (relGetIds(all).indexOf(assetId) < 0) relAdd(all, assetId);
+
+        // 2) master/cover — only if empty (single asset allowed)
+        let master = false;
+        if (cfg.setMasterIfEmpty) {
+          const cover = product.getRelation(cfg.masterAssetRelation);
+          if (cover && relGetIds(cover).length === 0) { relAdd(cover, assetId); master = true; }
+        }
+
         await client.entities.saveAsync(product);
+        return { master };
+      }
+
+      // ---- results rendering (filter + search + counts) --------------------
+      function counts() {
+        const c = { total: results.length, ok: 0, miss: 0, amb: 0, err: 0 };
+        for (const r of results) {
+          if (r.ok) c.ok++;
+          else if (r.statusLabel === 'Not found') c.miss++;
+          else if (r.statusLabel === 'Ambiguous') c.amb++;
+          else c.err++;
+        }
+        return c;
+      }
+      function renderChips() {
+        const c = counts();
+        const okLabel = lastMode === 'dry' ? 'Matched' : 'Linked';
+        chipsEl.innerHTML =
+          `<span class="a-chip total">${c.total} image(s)</span>` +
+          `<span class="a-chip ok">✓ ${okLabel} ${c.ok}</span>` +
+          (c.miss ? `<span class="a-chip miss">⚠ Not found ${c.miss}</span>` : '') +
+          (c.amb ? `<span class="a-chip amb">⚠ Ambiguous ${c.amb}</span>` : '') +
+          (c.err ? `<span class="a-chip err">✗ Error ${c.err}</span>` : '');
+        chipsEl.style.display = 'flex';
+      }
+      function filteredRows() {
+        const mode = filterEl.value;
+        const q = (searchEl.value || '').trim().toLowerCase();
+        return results.filter(r => {
+          if (mode === 'problems' && r.ok) return false;
+          if (mode === 'matched' && !r.ok) return false;
+          if (q && r.name.toLowerCase().indexOf(q) < 0 && String(r.sku).toLowerCase().indexOf(q) < 0) return false;
+          return true;
+        });
+      }
+      function renderResults() {
+        if (!results.length) { resultsEl.style.display = 'none'; toolsEl.style.display = 'none'; return; }
+        toolsEl.style.display = 'flex';
+        const rows = filteredRows();
+        const CAP = 1000;
+        const shown = rows.slice(0, CAP);
+        const prodCol = lastMode === 'dry' ? 'Product' : 'Result';
+        let html = `<table><thead><tr><th style="width:34px"></th><th>File</th><th>SKU</th><th>${prodCol}</th></tr></thead><tbody>`;
+        for (const r of shown) {
+          const cls = r.ok ? 'ok' : 'bad';
+          const icon = r.ok ? '✓' : '✗';
+          const last = r.ok
+            ? `${(r.productName || '(no name)')} <span class="msg">(${r.resultNote || ('product ' + r.productId)})</span>`
+            : `<span class="msg">${r.statusLabel}${r.message ? ' — ' + r.message : ''}</span>`;
+          html += `<tr class="${cls}"><td>${icon}</td><td class="fn">${escapeHtml(r.name)}</td><td class="fn">${escapeHtml(r.sku)}</td><td>${last}</td></tr>`;
+        }
+        html += '</tbody></table>';
+        resultsEl.innerHTML = html;
+        resultsEl.style.display = 'block';
+        shownEl.textContent = rows.length > CAP
+          ? `showing ${CAP} of ${rows.length} (download for the full list)`
+          : `showing ${rows.length} of ${results.length}`;
+      }
+      function escapeHtml(s) { return String(s).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch])); }
+
+      filterEl.addEventListener('change', renderResults);
+      searchEl.addEventListener('input', renderResults);
+      dlBtn.addEventListener('click', downloadResults);
+
+      async function downloadResults() {
+        if (!results.length) return;
+        const XLSX = await loadScript(SHEETJS_URL, 'XLSX');
+        const header = ['File', 'SKU', 'Status', 'Product ID', 'Product Name', 'Detail'];
+        const rows = results.map(r => [r.name, r.sku, r.statusLabel, r.ok ? (r.productId || '') : '', r.ok ? (r.productName || '') : '', r.message || r.resultNote || '']);
+        const ws = XLSX.utils.aoa_to_sheet([header, ...rows]);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'Results');
+        const arr = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+        downloadBlob(new Blob([arr], { type: 'application/octet-stream' }), `AssetUpload_${lastMode}_${ts()}.xlsx`);
       }
 
       async function run(dryRun) {
-        clearLog(); dryBtn.disabled = true; goBtn.disabled = true;
+        clearAll(); dryBtn.disabled = true; goBtn.disabled = true;
+        lastMode = dryRun ? 'dry' : 'real';
         log(dryRun ? '── VALIDATE (no writes) ──' : '── UPLOAD & LINK ──', 'a-info');
         try {
           const imgs = await readImages();
           if (!imgs.length) { log('No image files found in the zip.', 'a-err'); return; }
-          log(`Found ${imgs.length} image(s).`, 'a-info');
+          log(`Found ${imgs.length} image(s). Resolving…`, 'a-info');
 
-          let matched = 0, uploaded = 0, linked = 0, errors = 0;
-          // Cache SKU -> product result within a run.
-          const cache = new Map();
+          const cache = new Map();  // SKU -> product lookup result (dedupes CH queries)
+          let done = 0;
 
           for (const img of imgs) {
             const sku = skuFromName(img.name);
             let prod = cache.get(sku);
             if (!prod) { try { prod = await findProductBySku(sku); } catch (e) { prod = { status: 'error', message: e.message }; } cache.set(sku, prod); }
 
-            if (prod.status !== 'ok') {
-              errors++;
-              const why = prod.status === 'none' ? `⚠ PRODUCT NOT FOUND for SKU "${sku}"`
-                : prod.status === 'multiple' ? `⚠ AMBIGUOUS — ${prod.count} products match SKU "${sku}"`
-                : `⚠ LOOKUP ERROR (SKU "${sku}") — ${prod.message}`;
-              log(`  ✗  ${img.name}  —  ${why}`, 'a-err');
-              continue;
-            }
-            matched++;
-            if (dryRun) { log(`  ✓  ${img.name}  —  SKU "${sku}"  →  ${prod.name || '(no name)'}  (product ${prod.id})`, 'a-ok'); continue; }
+            const rec = { name: img.name, sku, ok: false, statusLabel: '', productId: null, productName: '', message: '', resultNote: '' };
 
-            // Real run: upload + link
-            try {
-              const assetId = await uploadAsset(img); uploaded++;
-              await linkAssetToProduct(assetId, prod.id); linked++;
-              log(`  ✓ ${img.name} → asset ${assetId} linked to product ${prod.id} (${prod.name || ''})`, 'a-ok');
-            } catch (e) {
-              errors++;
-              log(`  ✗ ${img.name} → ${e && e.message ? e.message : e}`, 'a-err');
+            if (prod.status !== 'ok') {
+              rec.statusLabel = prod.status === 'none' ? 'Not found' : prod.status === 'multiple' ? 'Ambiguous' : 'Lookup error';
+              rec.message = prod.status === 'none' ? `no product for SKU "${sku}"`
+                : prod.status === 'multiple' ? `${prod.count} products match SKU "${sku}"`
+                : prod.message;
+            } else if (dryRun) {
+              rec.ok = true; rec.statusLabel = 'Matched'; rec.productId = prod.id; rec.productName = prod.name;
+              rec.resultNote = 'product ' + prod.id;
+            } else {
+              try {
+                const assetId = await uploadAsset(img);
+                const link = await linkAssetToProduct(assetId, prod.id);
+                rec.ok = true; rec.statusLabel = link.master ? 'Linked + cover' : 'Linked';
+                rec.productId = prod.id; rec.productName = prod.name;
+                rec.resultNote = `asset ${assetId} → product ${prod.id}${link.master ? ' (set as cover)' : ''}`;
+              } catch (e) {
+                rec.statusLabel = 'Write error'; rec.message = (e && e.message) ? e.message : String(e);
+              }
             }
+            results.push(rec);
+
+            done++;
+            if (done % 10 === 0 || done === imgs.length) status.textContent = `Processing ${done}/${imgs.length}…`;
           }
 
-          log('──────────────────────────────────────────', 'a-info');
-          if (dryRun) log(`Validate done — ${matched} of ${imgs.length} image(s) resolve to a product, ${errors} unresolved.`, errors ? 'a-err' : 'a-ok');
-          else log(`Done — uploaded ${uploaded}, linked ${linked}, errors ${errors} (of ${imgs.length}).`, errors ? 'a-err' : 'a-ok');
+          renderChips();
+          renderResults();
+          const c = counts();
+          status.textContent = `${currentFile.name} — done`;
+          if (dryRun) log(`Validate done — ${c.ok} matched, ${c.miss} not found, ${c.amb} ambiguous, ${c.err} error(s) of ${c.total}.`, (c.miss + c.amb + c.err) ? 'a-err' : 'a-ok');
+          else log(`Done — ${c.ok} uploaded & linked, ${c.miss + c.amb + c.err} not processed of ${c.total}.`, (c.miss + c.amb + c.err) ? 'a-err' : 'a-ok');
         } catch (e) {
           log(`✗ ${e && e.message ? e.message : e}`, 'a-err');
         } finally { dryBtn.disabled = false; goBtn.disabled = false; }
