@@ -137,6 +137,37 @@ function itemId(it) {
   return null;
 }
 
+const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', bmp: 'image/bmp', tif: 'image/tiff', tiff: 'image/tiff', webp: 'image/webp', svg: 'image/svg+xml', heic: 'image/heic', heif: 'image/heif' };
+function mimeFor(name) { return MIME[extOf(name)] || 'application/octet-stream'; }
+
+// Locate a real SDK constructor if the runtime exposes it (window / globalThis).
+function findCtor(names) {
+  const scopes = [typeof window !== 'undefined' ? window : null, typeof globalThis !== 'undefined' ? globalThis : null];
+  for (const sc of scopes) { if (!sc) continue; for (const n of names) { if (typeof sc[n] === 'function') return sc[n]; } }
+  return null;
+}
+
+// Duck-typed IUploadSource: what client.uploads.uploadAsync reads off the source.
+// Exposes the bytes in several shapes so the SDK can consume whichever it wants.
+function makeDuckSource(blob, buffer, fileName) {
+  const readable = {
+    contentType: blob.type, mimeType: blob.type,
+    length: blob.size, size: blob.size, fileSize: blob.size,
+    blob, buffer,
+    getBlob: () => blob,
+    arrayBuffer: () => blob.arrayBuffer(),
+    getStreamAsync: async () => (blob.stream ? blob.stream() : blob),
+    stream: () => (blob.stream ? blob.stream() : blob)
+  };
+  return {
+    fileName, name: fileName,
+    fileSize: blob.size, size: blob.size, contentType: blob.type, mimeType: blob.type,
+    getReadableSourceAsync: async () => readable,
+    getReadableSource: () => readable,
+    blob, buffer
+  };
+}
+
 // Find the M.PCM.Product whose SKU matches (FullText narrows, exact SKU verifies).
 async function findProductBySku(sku) {
   const chql = `Definition.Name=='M.PCM.Product' and FullText=='${String(sku).replace(/'/g, "''")}'`;
@@ -202,6 +233,7 @@ export default function createExternalRoot(rootElement) {
       let currentFile = null;
       let results = [];       // [{ name, sku, ok, statusLabel, productId, productName, message }]
       let lastMode = 'dry';
+      let uploadDiagDone = false;          // log the upload-API surface once per run set
       const assetTypeIdCache = new Map();  // M.AssetType identifier -> entity id
 
       function log(msg, cls) {
@@ -276,22 +308,51 @@ export default function createExternalRoot(rootElement) {
         return imgs;
       }
 
-      // Upload one image -> new asset id. Best-effort against the SDK upload client.
+      // Log the upload-API surface once, so we can confirm the exact shape this
+      // instance expects (constructors present? uploadAsync arity? sub-keys?).
+      function logUploadDiag() {
+        if (uploadDiagDone) return; uploadDiagDone = true;
+        let keys = '?'; try { keys = Object.keys(client.uploads).join(','); } catch (e) { /* ignore */ }
+        const has = n => !!findCtor([n]);
+        log(`upload API — client.uploads keys=[${keys}] uploadAsync.arity=${client.uploads.uploadAsync.length} ` +
+          `realClasses={UploadRequest:${has('UploadRequest')}, BlobUploadSource:${has('BlobUploadSource')}, ArrayBufferUploadSource:${has('ArrayBufferUploadSource')}}`, 'a-info');
+      }
+
+      // Upload one image -> new asset id. Prefers the real SDK classes if the
+      // runtime exposes them; otherwise sends a duck-typed upload source.
       async function uploadAsset(img) {
         if (!client || !client.uploads || typeof client.uploads.uploadAsync !== 'function') {
           throw new Error('client.uploads.uploadAsync not available — the upload API differs on this instance.');
         }
+        logUploadDiag();
+
         const buffer = await img.entry.async('arraybuffer');
-        const request = {
-          uploadSource: { data: buffer, fileName: img.name },
-          uploadConfiguration: cfg.uploadConfiguration,
-          actionName: cfg.uploadAction,
-          fileName: img.name
-        };
+        const blob = new Blob([buffer], { type: mimeFor(img.name) });
+
+        const UploadRequestCtor = findCtor(['UploadRequest']);
+        const BlobSrcCtor = findCtor(['BlobUploadSource']);
+        const AbSrcCtor = findCtor(['ArrayBufferUploadSource']);
+
+        let request;
+        if (UploadRequestCtor && (BlobSrcCtor || AbSrcCtor)) {
+          const src = BlobSrcCtor ? new BlobSrcCtor(blob, img.name) : new AbSrcCtor(buffer, img.name);
+          request = new UploadRequestCtor(src, cfg.uploadConfiguration, cfg.uploadAction);
+        } else {
+          const source = makeDuckSource(blob, buffer, img.name);
+          request = {
+            uploadSource: source, source: source,               // cover both field names
+            uploadConfiguration: cfg.uploadConfiguration,
+            uploadConfigurationName: cfg.uploadConfiguration,
+            actionName: cfg.uploadAction, action: cfg.uploadAction,
+            fileName: img.name
+          };
+        }
+
         const result = await client.uploads.uploadAsync(request);
         const aid = (result && (result.assetId || result.entityId || result.id ||
-          (result.entity && result.entity.id))) || null;
-        if (aid == null) throw new Error('upload returned no asset id (shape: ' + JSON.stringify(result).slice(0, 200) + ')');
+          (result.entity && result.entity.id) || result.targetId ||
+          (Array.isArray(result) && result[0] && (result[0].id || result[0].entityId)))) || null;
+        if (aid == null) throw new Error('upload returned no asset id (shape: ' + (() => { try { return JSON.stringify(result).slice(0, 200); } catch (e) { return String(result); } })() + ')');
         return aid;
       }
 
