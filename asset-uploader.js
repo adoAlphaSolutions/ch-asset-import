@@ -28,7 +28,8 @@
 //
 // Configuration (JSON), optional:
 //   {
-//     "skuSeparator": "_",                       // SKU = filename stem before this (blank = whole stem)
+//     "skuSeparator": "",                        // if set, SKU = stem before FIRST occurrence of this
+//     "stripSequenceSuffix": true,               // also try stem with a trailing -1/_2/ 3/(4) removed
 //     "allAssetsRelation": "PCMProductToAllAssets",
 //     "masterAssetRelation": "PCMProductToMasterAsset",
 //     "setMasterIfEmpty": true,                  // set cover only when product has none
@@ -43,6 +44,7 @@ const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.
 
 const DEFAULTS = {
   skuSeparator: '',
+  stripSequenceSuffix: true,
   allAssetsRelation: 'PCMProductToAllAssets',
   masterAssetRelation: 'PCMProductToMasterAsset',
   setMasterIfEmpty: true,
@@ -211,10 +213,45 @@ export default function createExternalRoot(rootElement) {
       drop.addEventListener('dragleave', () => drop.classList.remove('a-hover'));
       drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('a-hover'); onFile(e.dataTransfer.files[0]); });
 
-      function skuFromName(name) {
-        const stem = stripExt(baseName(name));
-        if (cfg.skuSeparator) { const i = stem.indexOf(cfg.skuSeparator); return i > 0 ? stem.slice(0, i) : stem; }
-        return stem;
+      // Build ordered SKU candidates from a filename. We try the most specific
+      // first (whole stem), then progressively strip a trailing sequence suffix
+      // (-1, _2, " 3", "(4)") so "sku-1.png"/"sku-2.png" both resolve to "sku"
+      // WITHOUT truncating SKUs that legitimately contain "-" or "_".
+      function skuCandidates(name) {
+        const stem = stripExt(baseName(name)).trim();
+        const cands = [];
+        const push = s => { s = (s || '').trim(); if (s && cands.indexOf(s) < 0) cands.push(s); };
+
+        // Optional hard rule: everything before the first configured separator.
+        if (cfg.skuSeparator) { const i = stem.indexOf(cfg.skuSeparator); if (i > 0) push(stem.slice(0, i)); }
+
+        push(stem); // whole stem — matches SKUs that contain "-"/"_" as-is
+
+        // Progressively drop a trailing sequence suffix. Requires a separator
+        // (or parentheses) before the digits, so "SKU100" is never shortened.
+        if (cfg.stripSequenceSuffix) {
+          let s = stem;
+          for (let k = 0; k < 6; k++) {
+            const t = s.replace(/\s*\(\d+\)$/, '').replace(/[-_ ]\d+$/, '');
+            if (t === s || !t) break;
+            push(t); s = t;
+          }
+        }
+        return cands.length ? cands : [stem];
+      }
+
+      // Try each candidate SKU until one resolves to exactly one product.
+      // Returns the product result plus the SKU that actually matched.
+      async function resolveProduct(name, cache) {
+        const cands = skuCandidates(name);
+        let lastNonOk = null;
+        for (const c of cands) {
+          let r = cache.get(c);
+          if (!r) { try { r = await findProductBySku(c); } catch (e) { r = { status: 'error', message: e.message }; } cache.set(c, r); }
+          if (r.status === 'ok') return Object.assign({}, r, { sku: c });
+          lastNonOk = Object.assign({}, r, { sku: c });
+        }
+        return lastNonOk || { status: 'none', candidates: 0, sku: cands[0] };
       }
 
       async function readImages() {
@@ -367,13 +404,12 @@ export default function createExternalRoot(rootElement) {
           if (!imgs.length) { log('No image files found in the zip.', 'a-err'); return; }
           log(`Found ${imgs.length} image(s). Resolving…`, 'a-info');
 
-          const cache = new Map();  // SKU -> product lookup result (dedupes CH queries)
+          const cache = new Map();  // candidate SKU -> product lookup result (dedupes CH queries)
           let done = 0;
 
           for (const img of imgs) {
-            const sku = skuFromName(img.name);
-            let prod = cache.get(sku);
-            if (!prod) { try { prod = await findProductBySku(sku); } catch (e) { prod = { status: 'error', message: e.message }; } cache.set(sku, prod); }
+            const prod = await resolveProduct(img.name, cache);
+            const sku = prod.sku;
 
             const rec = { name: img.name, sku, ok: false, statusLabel: '', productId: null, productName: '', message: '', resultNote: '' };
 
