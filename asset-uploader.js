@@ -44,6 +44,7 @@
 //   }
 // ============================================================================
 
+const BUILD_VERSION = 'v1.4 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -101,6 +102,7 @@ const CSS = `
 
   .a-log   { background: #1a202c; color: #e2e8f0; font-family: monospace; font-size: 12px; padding: 12px 14px; border-radius: 6px; margin-top: 4px; max-height: 200px; overflow: auto; white-space: pre-wrap; display: none; }
   .a-ok { color: #68d391; } .a-skip { color: #cbd5e0; } .a-err { color: #fc8181; } .a-info { color: #90cdf4; }
+  .a-foot  { margin-top: 16px; font-size: 11px; color: #a0aec0; text-align: right; }
 `;
 
 function loadScript(url, globalName) {
@@ -220,6 +222,7 @@ export default function createExternalRoot(rootElement) {
         <div class="a-results" id="a-results"></div>
 
         <div class="a-log" id="a-log"></div>
+        <div class="a-foot" id="a-foot">Asset Uploader + Linker · ${BUILD_VERSION}</div>
       `;
       rootElement.innerHTML = ''; rootElement.appendChild(style); rootElement.appendChild(wrap);
 
