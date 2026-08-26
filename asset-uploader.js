@@ -44,7 +44,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v1.4 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v1.5 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -237,6 +237,7 @@ export default function createExternalRoot(rootElement) {
       let results = [];       // [{ name, sku, ok, statusLabel, productId, productName, message }]
       let lastMode = 'dry';
       let uploadDiagDone = false;          // log the upload-API surface once per run set
+      let uploadDiagText = '';             // cached surface string, appended to first error
       const assetTypeIdCache = new Map();  // M.AssetType identifier -> entity id
 
       function log(msg, cls) {
@@ -313,12 +314,17 @@ export default function createExternalRoot(rootElement) {
 
       // Log the upload-API surface once, so we can confirm the exact shape this
       // instance expects (constructors present? uploadAsync arity? sub-keys?).
+      function computeUploadDiag() {
+        let keys = '?'; try { keys = Object.keys(client.uploads).join(','); } catch (e) { /* ignore */ }
+        let proto = '?'; try { proto = Object.getOwnPropertyNames(Object.getPrototypeOf(client.uploads)).filter(n => n !== 'constructor').join(','); } catch (e) { /* ignore */ }
+        const has = n => !!findCtor([n]);
+        uploadDiagText = `uploads.keys=[${keys}] uploads.methods=[${proto}] uploadAsync.arity=${client.uploads.uploadAsync.length} ` +
+          `real={UploadRequest:${has('UploadRequest')},BlobUploadSource:${has('BlobUploadSource')},ArrayBufferUploadSource:${has('ArrayBufferUploadSource')}}`;
+        return uploadDiagText;
+      }
       function logUploadDiag() {
         if (uploadDiagDone) return; uploadDiagDone = true;
-        let keys = '?'; try { keys = Object.keys(client.uploads).join(','); } catch (e) { /* ignore */ }
-        const has = n => !!findCtor([n]);
-        log(`upload API — client.uploads keys=[${keys}] uploadAsync.arity=${client.uploads.uploadAsync.length} ` +
-          `realClasses={UploadRequest:${has('UploadRequest')}, BlobUploadSource:${has('BlobUploadSource')}, ArrayBufferUploadSource:${has('ArrayBufferUploadSource')}}`, 'a-info');
+        log('upload API — ' + computeUploadDiag(), 'a-info');
       }
 
       // Upload one image -> new asset id. Prefers the real SDK classes if the
@@ -357,7 +363,8 @@ export default function createExternalRoot(rootElement) {
           result = await client.uploads.uploadAsync(request);
         } catch (e) {
           const tag = usedReal ? 'sdk-classes' : 'duck';
-          throw new Error(`[${tag}] ${e && e.message ? e.message : e}`);
+          const msg = e && e.message ? e.message : String(e);
+          throw new Error(`[${tag}] ${msg}  ||  ${uploadDiagText || computeUploadDiag()}`);
         }
         const aid = (result && (result.assetId || result.entityId || result.id ||
           (result.entity && result.entity.id) || result.targetId ||
