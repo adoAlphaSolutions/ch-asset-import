@@ -10,6 +10,9 @@
 //        • if the product has NO master/cover yet, also sets it as the single
 //          PCMProductToMasterAsset (cover image). Only the first asset per
 //          product becomes the cover; the rest are all-assets only.
+//   5. (real run) sets the asset's own type via AssetTypeToAsset (asset is child
+//      of the M.AssetType taxonomy): cover asset -> M.AssetType.Thumbnail,
+//      every other asset -> M.AssetType.PIMProduct.Stock.
 //
 // Two buttons:
 //   • Validate (dry run) — reads the zip, resolves each SKU to a product, and
@@ -33,6 +36,9 @@
 //     "allAssetsRelation": "PCMProductToAllAssets",
 //     "masterAssetRelation": "PCMProductToMasterAsset",
 //     "setMasterIfEmpty": true,                  // set cover only when product has none
+//     "assetTypeRelation": "AssetTypeToAsset",   // M.Asset is child of M.AssetType
+//     "stockAssetType": "M.AssetType.PIMProduct.Stock",  // non-cover assets
+//     "coverAssetType": "M.AssetType.Thumbnail",         // the cover asset
 //     "uploadConfiguration": "AssetUploadConfiguration",
 //     "uploadAction": "NewAsset"
 //   }
@@ -48,6 +54,9 @@ const DEFAULTS = {
   allAssetsRelation: 'PCMProductToAllAssets',
   masterAssetRelation: 'PCMProductToMasterAsset',
   setMasterIfEmpty: true,
+  assetTypeRelation: 'AssetTypeToAsset',
+  stockAssetType: 'M.AssetType.PIMProduct.Stock',
+  coverAssetType: 'M.AssetType.Thumbnail',
   uploadConfiguration: 'AssetUploadConfiguration',
   uploadAction: 'NewAsset'
 };
@@ -193,6 +202,7 @@ export default function createExternalRoot(rootElement) {
       let currentFile = null;
       let results = [];       // [{ name, sku, ok, statusLabel, productId, productName, message }]
       let lastMode = 'dry';
+      const assetTypeIdCache = new Map();  // M.AssetType identifier -> entity id
 
       function log(msg, cls) {
         logEl.style.display = 'block';
@@ -298,6 +308,38 @@ export default function createExternalRoot(rootElement) {
         if (Array.isArray(rel.children)) { rel.children.push(id); return; }
         if (typeof rel.setIds === 'function') { rel.setIds([...relGetIds(rel), id]); return; }
         throw new Error('could not add id to relation (unknown relation API)');
+      }
+      // Replace the ids on a relation (used to set the asset's single type parent).
+      function relSetIds(rel, ids) {
+        if (typeof rel.setIds === 'function') { rel.setIds(ids); return; }
+        if (Array.isArray(rel.parents)) { rel.parents.length = 0; for (const i of ids) rel.parents.push(i); return; }
+        if (Array.isArray(rel.children)) { rel.children.length = 0; for (const i of ids) rel.children.push(i); return; }
+        if (typeof rel.setParents === 'function') { rel.setParents(ids); return; }
+        if (typeof rel.add === 'function') { for (const i of ids) rel.add(i); return; }
+        throw new Error('could not set ids on relation (unknown relation API)');
+      }
+
+      // Resolve an M.AssetType taxonomy identifier -> entity id (cached per session).
+      async function assetTypeId(identifier) {
+        if (assetTypeIdCache.has(identifier)) return assetTypeIdCache.get(identifier);
+        const ent = await client.entities.getAsync(identifier);
+        const id = ent && (ent.id != null ? ent.id : (typeof ent.getId === 'function' ? ent.getId() : null));
+        if (id == null) throw new Error(`asset type '${identifier}' not found`);
+        assetTypeIdCache.set(identifier, id);
+        return id;
+      }
+
+      // Set the asset's type via AssetTypeToAsset (asset is CHILD of M.AssetType).
+      // Cover -> coverAssetType (Thumbnail); otherwise -> stockAssetType (Stock).
+      async function setAssetType(assetId, isCover) {
+        const identifier = isCover ? cfg.coverAssetType : cfg.stockAssetType;
+        const typeId = await assetTypeId(identifier);
+        const asset = await client.entities.getAsync(assetId);
+        const rel = asset.getRelation(cfg.assetTypeRelation);
+        if (!rel) throw new Error(`relation ${cfg.assetTypeRelation} not found on asset`);
+        relSetIds(rel, [typeId]);   // single type; replace rather than append
+        await client.entities.saveAsync(asset);
+        return identifier;
       }
 
       // Link asset -> product. Always add to the all-assets relation; if the
@@ -425,9 +467,13 @@ export default function createExternalRoot(rootElement) {
               try {
                 const assetId = await uploadAsset(img);
                 const link = await linkAssetToProduct(assetId, prod.id);
+                let typeIdent;
+                try { typeIdent = await setAssetType(assetId, link.master); }
+                catch (te) { throw new Error(`linked but asset type not set: ${te.message}`); }
+                const shortType = String(typeIdent).replace(/^M\.AssetType\./, '');
                 rec.ok = true; rec.statusLabel = link.master ? 'Linked + cover' : 'Linked';
                 rec.productId = prod.id; rec.productName = prod.name;
-                rec.resultNote = `asset ${assetId} → product ${prod.id}${link.master ? ' (set as cover)' : ''}`;
+                rec.resultNote = `asset ${assetId} → product ${prod.id}${link.master ? ' (cover)' : ''}, type ${shortType}`;
               } catch (e) {
                 rec.statusLabel = 'Write error'; rec.message = (e && e.message) ? e.message : String(e);
               }
