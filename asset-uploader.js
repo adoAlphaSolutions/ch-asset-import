@@ -333,8 +333,9 @@ export default function createExternalRoot(rootElement) {
         const BlobSrcCtor = findCtor(['BlobUploadSource']);
         const AbSrcCtor = findCtor(['ArrayBufferUploadSource']);
 
+        const usedReal = !!(UploadRequestCtor && (BlobSrcCtor || AbSrcCtor));
         let request;
-        if (UploadRequestCtor && (BlobSrcCtor || AbSrcCtor)) {
+        if (usedReal) {
           const src = BlobSrcCtor ? new BlobSrcCtor(blob, img.name) : new AbSrcCtor(buffer, img.name);
           request = new UploadRequestCtor(src, cfg.uploadConfiguration, cfg.uploadAction);
         } else {
@@ -348,7 +349,13 @@ export default function createExternalRoot(rootElement) {
           };
         }
 
-        const result = await client.uploads.uploadAsync(request);
+        let result;
+        try {
+          result = await client.uploads.uploadAsync(request);
+        } catch (e) {
+          const tag = usedReal ? 'sdk-classes' : 'duck';
+          throw new Error(`[${tag}] ${e && e.message ? e.message : e}`);
+        }
         const aid = (result && (result.assetId || result.entityId || result.id ||
           (result.entity && result.entity.id) || result.targetId ||
           (Array.isArray(result) && result[0] && (result[0].id || result[0].entityId)))) || null;
