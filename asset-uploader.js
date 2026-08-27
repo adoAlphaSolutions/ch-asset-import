@@ -44,7 +44,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v1.5 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v1.6 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -149,6 +149,16 @@ function findCtor(names) {
   return null;
 }
 
+function safeJson(v) { try { return JSON.stringify(v).slice(0, 240); } catch (e) { return String(v); } }
+function extractAssetId(r) {
+  if (r == null) return null;
+  if (typeof r === 'number') return r;
+  if (typeof r === 'string' && /^\d+$/.test(r)) return Number(r);
+  return r.assetId || r.entityId || r.id || (r.entity && r.entity.id) || r.targetId ||
+    (r.asset && (r.asset.id || r.asset.entityId)) ||
+    (Array.isArray(r) && r[0] && (r[0].id || r[0].entityId)) || null;
+}
+
 // Duck-typed IUploadSource: what client.uploads.uploadAsync reads off the source.
 // Exposes the bytes in several shapes so the SDK can consume whichever it wants.
 function makeDuckSource(blob, buffer, fileName) {
@@ -238,6 +248,7 @@ export default function createExternalRoot(rootElement) {
       let lastMode = 'dry';
       let uploadDiagDone = false;          // log the upload-API surface once per run set
       let uploadDiagText = '';             // cached surface string, appended to first error
+      let winningForm = '';                // which upload call form succeeded (logged once)
       const assetTypeIdCache = new Map();  // M.AssetType identifier -> entity id
 
       function log(msg, cls) {
@@ -337,39 +348,46 @@ export default function createExternalRoot(rootElement) {
 
         const buffer = await img.entry.async('arraybuffer');
         const blob = new Blob([buffer], { type: mimeFor(img.name) });
+        const file = (typeof File === 'function') ? new File([blob], img.name, { type: blob.type }) : blob;
+        const source = makeDuckSource(blob, buffer, img.name);
 
-        const UploadRequestCtor = findCtor(['UploadRequest']);
-        const BlobSrcCtor = findCtor(['BlobUploadSource']);
-        const AbSrcCtor = findCtor(['ArrayBufferUploadSource']);
+        // uploadAsync arity is 2 => (request, source). Build the request metadata
+        // both with the config as a string and as { name } (we don't know which
+        // the SDK guards want), and try the browser-friendly uploadFileAsync too.
+        const metaStr = { fileName: img.name, fileSize: blob.size, uploadConfiguration: cfg.uploadConfiguration, actionName: cfg.uploadAction, action: cfg.uploadAction };
+        const metaObj = { fileName: img.name, fileSize: blob.size, uploadConfiguration: { name: cfg.uploadConfiguration }, actionName: cfg.uploadAction, action: cfg.uploadAction };
+        const up = client.uploads;
 
-        const usedReal = !!(UploadRequestCtor && (BlobSrcCtor || AbSrcCtor));
-        let request;
-        if (usedReal) {
-          const src = BlobSrcCtor ? new BlobSrcCtor(blob, img.name) : new AbSrcCtor(buffer, img.name);
-          request = new UploadRequestCtor(src, cfg.uploadConfiguration, cfg.uploadAction);
-        } else {
-          const source = makeDuckSource(blob, buffer, img.name);
-          request = {
-            uploadSource: source, source: source,               // cover both field names
-            uploadConfiguration: cfg.uploadConfiguration,
-            uploadConfigurationName: cfg.uploadConfiguration,
-            actionName: cfg.uploadAction, action: cfg.uploadAction,
-            fileName: img.name
-          };
+        const attempts = [];
+        if (typeof up.uploadFileAsync === 'function') {
+          attempts.push(['uploadFileAsync(file, metaStr)', () => up.uploadFileAsync(file, metaStr)]);
+          attempts.push(['uploadFileAsync(file, metaObj)', () => up.uploadFileAsync(file, metaObj)]);
         }
+        attempts.push(['uploadAsync(metaStr, source)', () => up.uploadAsync(metaStr, source)]);
+        attempts.push(['uploadAsync(metaObj, source)', () => up.uploadAsync(metaObj, source)]);
 
-        let result;
-        try {
-          result = await client.uploads.uploadAsync(request);
-        } catch (e) {
-          const tag = usedReal ? 'sdk-classes' : 'duck';
-          const msg = e && e.message ? e.message : String(e);
-          throw new Error(`[${tag}] ${msg}  ||  ${uploadDiagText || computeUploadDiag()}`);
+        // A pre-flight (synchronous/arg) failure is safe to retry with the next
+        // form; a server-side failure is NOT (it may have created something), so
+        // we surface it immediately.
+        const preflight = /should not be null|is not a function|cannot read propert|is not defined|is not a constructor|expected .* argument/i;
+
+        let result, usedForm, lastMsg = '';
+        for (const [name, fn] of attempts) {
+          try { result = await fn(); usedForm = name; break; }
+          catch (e) {
+            lastMsg = e && e.message ? e.message : String(e);
+            if (!preflight.test(lastMsg)) {
+              throw new Error(`[${name}] ${lastMsg}  ||  ${uploadDiagText || computeUploadDiag()}`);
+            }
+          }
         }
-        const aid = (result && (result.assetId || result.entityId || result.id ||
-          (result.entity && result.entity.id) || result.targetId ||
-          (Array.isArray(result) && result[0] && (result[0].id || result[0].entityId)))) || null;
-        if (aid == null) throw new Error('upload returned no asset id (shape: ' + (() => { try { return JSON.stringify(result).slice(0, 200); } catch (e) { return String(result); } })() + ')');
+        if (usedForm == null) {
+          throw new Error(`[all-forms-failed] ${lastMsg}  ||  ${uploadDiagText || computeUploadDiag()}`);
+        }
+        if (winningForm !== usedForm) { winningForm = usedForm; log(`✓ upload form that works: ${usedForm}`, 'a-ok'); }
+
+        const aid = extractAssetId(result);
+        if (aid == null) throw new Error(`upload ok via ${usedForm} but no asset id returned (result: ${safeJson(result)})`);
         return aid;
       }
 
