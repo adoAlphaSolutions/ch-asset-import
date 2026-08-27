@@ -48,7 +48,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v3.1 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v3.2 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -265,9 +265,10 @@ function errDetail(e) {
       }
     }
   } catch (_) { /* ignore */ }
-  for (const k of ['parameterName', 'argumentName', 'paramName', 'name', 'detail', 'title', 'body', 'responseText', 'data', 'error', 'innerException']) {
-    try { if (e[k] != null) parts.push(`${k}=${typeof e[k] === 'object' ? safeJson(e[k]) : String(e[k]).slice(0, 200)}`); } catch (_) { /* ignore */ }
+  for (const k of ['parameterName', 'argumentName', 'paramName', 'name', 'errors', 'validationErrors', 'messages', 'detail', 'title', 'body', 'responseText', 'data', 'error', 'innerException']) {
+    try { if (e[k] != null) parts.push(`${k}=${typeof e[k] === 'object' ? safeJson(e[k]) : String(e[k]).slice(0, 300)}`); } catch (_) { /* ignore */ }
   }
+  try { if (typeof e.getErrors === 'function') { const ge = e.getErrors(); if (ge) parts.push(`getErrors=${safeJson(ge)}`); } } catch (_) { /* ignore */ }
   try { const ks = Object.keys(e); if (ks.length) parts.push(`ekeys=[${ks.join(',')}]`); } catch (_) { /* ignore */ }
   try { if (e.stack) parts.push(`stack=${String(e.stack).split('\n').slice(0, 2).join(' | ').slice(0, 220)}`); } catch (_) { /* ignore */ }
   return parts.join(' ; ');
@@ -663,7 +664,8 @@ export default function createExternalRoot(rootElement) {
             if (lc) relSet(lc, [lcId]);
           } catch (e) { /* lifecycle is best-effort */ }
         }
-        await client.entities.saveAsync(asset);
+        try { await client.entities.saveAsync(asset); }
+        catch (e) { throw new Error(`asset save failed — ${errDetail(e)}`); }
         return identifier;
       }
 
@@ -701,7 +703,8 @@ export default function createExternalRoot(rootElement) {
           if (cover && relIds(cover).length === 0) { relSet(cover, [assetId]); master = true; }
         }
 
-        await client.entities.saveAsync(product);
+        try { await client.entities.saveAsync(product); }
+        catch (e) { throw new Error(`product save failed — ${errDetail(e)}`); }
         return { master };
       }
 
