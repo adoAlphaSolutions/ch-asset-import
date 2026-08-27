@@ -44,7 +44,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v2.2 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v2.3 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -183,10 +183,11 @@ function errDetail(e) {
       }
     }
   } catch (_) { /* ignore */ }
-  for (const k of ['detail', 'title', 'body', 'responseText', 'data', 'error', 'innerException']) {
-    try { if (e[k] != null) parts.push(`${k}=${typeof e[k] === 'object' ? safeJson(e[k]) : String(e[k]).slice(0, 300)}`); } catch (_) { /* ignore */ }
+  for (const k of ['parameterName', 'argumentName', 'paramName', 'name', 'detail', 'title', 'body', 'responseText', 'data', 'error', 'innerException']) {
+    try { if (e[k] != null) parts.push(`${k}=${typeof e[k] === 'object' ? safeJson(e[k]) : String(e[k]).slice(0, 200)}`); } catch (_) { /* ignore */ }
   }
   try { const ks = Object.keys(e); if (ks.length) parts.push(`ekeys=[${ks.join(',')}]`); } catch (_) { /* ignore */ }
+  try { if (e.stack) parts.push(`stack=${String(e.stack).split('\n').slice(0, 2).join(' | ').slice(0, 220)}`); } catch (_) { /* ignore */ }
   return parts.join(' ; ');
 }
 function extractAssetId(r) {
@@ -203,7 +204,7 @@ function extractAssetId(r) {
 function makeDuckSource(blob, buffer, fileName) {
   const readable = {
     contentType: blob.type, mimeType: blob.type,
-    length: blob.size, size: blob.size, fileSize: blob.size,
+    length: blob.size, size: blob.size, fileSize: blob.size, contentLength: blob.size,
     blob, buffer,
     getBlob: () => blob,
     arrayBuffer: () => blob.arrayBuffer(),
@@ -212,7 +213,8 @@ function makeDuckSource(blob, buffer, fileName) {
   };
   return {
     fileName, name: fileName,
-    fileSize: blob.size, size: blob.size, contentType: blob.type, mimeType: blob.type,
+    fileSize: blob.size, size: blob.size, length: blob.size, fileLength: blob.size, contentLength: blob.size,
+    contentType: blob.type, mimeType: blob.type,
     getReadableSourceAsync: async () => readable,
     getReadableSource: () => readable,
     blob, buffer
@@ -413,10 +415,12 @@ export default function createExternalRoot(rootElement) {
         // i.e. uploadAsync(request) with the source EMBEDDED, id from Location.
         const up = client.uploads;
         const source = makeDuckSource(blob, buffer, img.name);
-        const reqEmbedded = { uploadSource: source, uploadConfiguration: cfg.uploadConfiguration, actionName: cfg.uploadAction };
+        // The SDK reads the source from request.source (confirmed by diagnostics),
+        // so set that primarily; keep uploadSource as an alias just in case.
+        const reqEmbedded = { source: source, uploadSource: source, uploadConfiguration: cfg.uploadConfiguration, actionName: cfg.uploadAction, fileName: img.name, fileSize: blob.size };
 
         const attempts = [
-          ['uploadAsync({uploadSource,uploadConfiguration,actionName})', () => up.uploadAsync(reqEmbedded)],
+          ['uploadAsync({source,uploadConfiguration,actionName})', () => up.uploadAsync(reqEmbedded)],
           // Fallback: the chunked browser helper (reaches the server but 500s on this instance).
           ['uploadFileAsync(file, {fileName,fileSize,uploadConfiguration,actionName})', () => up.uploadFileAsync(file, { fileName: img.name, fileSize: blob.size, uploadConfiguration: cfg.uploadConfiguration, actionName: cfg.uploadAction })]
         ];
