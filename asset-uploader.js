@@ -48,7 +48,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v3.5 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v3.6 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -165,9 +165,19 @@ const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'im
 function mimeFor(name) { return MIME[extOf(name)] || 'application/octet-stream'; }
 
 // Locate a real SDK constructor if the runtime exposes it (window / globalThis).
+let SDK_SCOPES = [];   // extra objects to search for SDK constructor classes
 function findCtor(names) {
-  const scopes = [typeof window !== 'undefined' ? window : null, typeof globalThis !== 'undefined' ? globalThis : null];
-  for (const sc of scopes) { if (!sc) continue; for (const n of names) { if (typeof sc[n] === 'function') return sc[n]; } }
+  const scopes = [typeof window !== 'undefined' ? window : null, typeof globalThis !== 'undefined' ? globalThis : null, ...SDK_SCOPES];
+  for (const sc of scopes) {
+    if (!sc) continue;
+    for (const n of names) {
+      try { if (typeof sc[n] === 'function') return sc[n]; } catch (e) { /* ignore */ }
+      // one level deep (e.g. clientBuilder.models.UploadRequest)
+      for (const k of ['models', 'contracts', 'upload', 'uploads', 'sdk', 'classes']) {
+        try { if (sc[k] && typeof sc[k][n] === 'function') return sc[k][n]; } catch (e) { /* ignore */ }
+      }
+    }
+  }
   return null;
 }
 
@@ -332,11 +342,14 @@ async function findProductBySku(sku) {
 }
 
 // ---------------------------------------------------------------------------
-export default function createExternalRoot(rootElement) {
+export default function createExternalRoot(rootElement, clientBuilder) {
   return {
     render(context) {
       const client = context && context.client;
       const cfg = Object.assign({}, DEFAULTS, (context && context.config) || {});
+      // Register objects that might expose the SDK classes (UploadRequest, etc.)
+      // so findCtor can locate them without a bundled import.
+      SDK_SCOPES = [clientBuilder, context, client, client && client.uploads].filter(Boolean);
 
       const style = document.createElement('style'); style.textContent = CSS;
       const wrap = document.createElement('div'); wrap.className = 'a-wrap';
@@ -385,6 +398,8 @@ export default function createExternalRoot(rootElement) {
       let results = [];       // [{ name, sku, ok, statusLabel, productId, productName, message }]
       let lastMode = 'dry';
       let uploadDiagDone = false;          // log the upload-API surface once per run set
+      let attachDiagDone = false;          // log whether SDK upload classes are reachable
+      let attachFormLogged = false;        // log the working file-attach form once
       let uploadDiagText = '';             // cached surface string, appended to first error
       let winningForm = '';                // which upload call form succeeded (logged once)
       const assetTypeIdCache = new Map();  // M.AssetType identifier -> entity id
@@ -745,11 +760,27 @@ export default function createExternalRoot(rootElement) {
         return identifier;
       }
 
-      // Attach the image binary to an EXISTING asset via the upload pipeline
-      // (action NewMainFile + AssetId), mirroring the C# entityId>0 branch. This
-      // is the part that needs M.UploadConfiguration Read permission.
+      // Attach the image binary to an EXISTING asset (action NewMainFile + AssetId),
+      // mirroring the C# entityId>0 branch. Prefers the real SDK classes
+      // (ArrayBufferUploadSource + UploadRequest) per Sitecore's guidance; falls
+      // back to uploadFileAsync if those classes aren't reachable in this runtime.
       async function attachFileToAsset(assetId, img) {
         const buffer = await img.entry.async('arraybuffer');
+        const AbSrc = findCtor(['ArrayBufferUploadSource']);
+        const UploadReq = findCtor(['UploadRequest']);
+        if (!attachDiagDone) {
+          attachDiagDone = true;
+          log(`upload classes — ArrayBufferUploadSource:${!!AbSrc} UploadRequest:${!!UploadReq} HttpUploadSource:${!!findCtor(['HttpUploadSource'])}`, 'a-info');
+        }
+        if (AbSrc && UploadReq) {
+          const source = new AbSrc(buffer, img.name);
+          const request = new UploadReq(source, cfg.uploadConfiguration, 'NewMainFile');
+          try { request.actionParameters = { AssetId: assetId }; } catch (e) { /* ignore */ }
+          try { request.ActionParameters = { AssetId: assetId }; } catch (e) { /* ignore */ }
+          if (!attachFormLogged) { attachFormLogged = true; log('file attach via real SDK classes (uploadAsync)', 'a-ok'); }
+          return await client.uploads.uploadAsync(request);
+        }
+        // Fallback: chunked browser helper (500s on this instance without the classes)
         const blob = new Blob([buffer], { type: mimeFor(img.name) });
         const file = (typeof File === 'function') ? new File([blob], img.name, { type: blob.type }) : blob;
         return await client.uploads.uploadFileAsync(file, {
