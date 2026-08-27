@@ -44,7 +44,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v1.7 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v1.8 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -154,7 +154,7 @@ function safeJson(v) { try { return JSON.stringify(v).slice(0, 240); } catch (e)
 function errDetail(e) {
   if (!e) return '';
   const parts = [e.message || String(e)];
-  for (const k of ['detail', 'title', 'body', 'responseText', 'data', 'error', 'innerException']) {
+  for (const k of ['responseMessage', 'statusCode', 'detail', 'title', 'body', 'responseText', 'data', 'error', 'innerException']) {
     try { if (e[k] != null) parts.push(`${k}=${typeof e[k] === 'object' ? safeJson(e[k]) : String(e[k]).slice(0, 200)}`); } catch (_) { /* ignore */ }
   }
   try { const ks = Object.keys(e); if (ks.length) parts.push(`ekeys=[${ks.join(',')}]`); } catch (_) { /* ignore */ }
@@ -359,7 +359,6 @@ export default function createExternalRoot(rootElement) {
         const buffer = await img.entry.async('arraybuffer');
         const blob = new Blob([buffer], { type: mimeFor(img.name) });
         const file = (typeof File === 'function') ? new File([blob], img.name, { type: blob.type }) : blob;
-        const source = makeDuckSource(blob, buffer, img.name);
 
         // uploadFileAsync(file, request) is the correct browser form (confirmed:
         // it reaches the server). The SDK appends the request's own fields to the
@@ -371,8 +370,7 @@ export default function createExternalRoot(rootElement) {
 
         const attempts = [
           ['uploadFileAsync(file, {fileName,fileSize,uploadConfiguration,actionName})', () => up.uploadFileAsync(file, reqFull)],
-          ['uploadFileAsync(file, {fileName,fileSize,uploadConfiguration})', () => up.uploadFileAsync(file, reqNoAction)],
-          ['uploadAsync({...,actionName}, source)', () => up.uploadAsync(reqFull, source)]
+          ['uploadFileAsync(file, {fileName,fileSize,uploadConfiguration})', () => up.uploadFileAsync(file, reqNoAction)]
         ];
 
         // Try each form; an upload that 500s before finalization creates nothing,
