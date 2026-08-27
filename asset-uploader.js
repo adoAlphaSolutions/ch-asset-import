@@ -44,7 +44,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v2.1 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v2.2 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -150,6 +150,19 @@ function findCtor(names) {
 }
 
 function safeJson(v) { try { return JSON.stringify(v).slice(0, 240); } catch (e) { return String(v); } }
+// The upload response carries the new asset URL in a Location header (mirrors the
+// working C# LinkHelper.IdFromEntityAsync(response.Headers.Location)).
+function locationFromResponse(r) {
+  if (!r) return null;
+  try { if (r.headers && typeof r.headers.get === 'function') { const l = r.headers.get('Location') || r.headers.get('location'); if (l) return l; } } catch (_) { /* ignore */ }
+  try { if (r.headers) { const l = r.headers.Location || r.headers.location; if (l) return l; } } catch (_) { /* ignore */ }
+  return r.location || r.Location || (r.self && r.self.href) || null;
+}
+function idFromLocation(loc) {
+  if (!loc) return null;
+  const m = String(loc).match(/(\d+)(?:[/?#].*)?$/);
+  return m ? Number(m[1]) : null;
+}
 // Pull as much detail as possible out of an SDK/HTTP error for diagnostics.
 function errDetail(e) {
   if (!e) return '';
@@ -392,21 +405,21 @@ export default function createExternalRoot(rootElement) {
         const blob = new Blob([buffer], { type: mimeFor(img.name) });
         const file = (typeof File === 'function') ? new File([blob], img.name, { type: blob.type }) : blob;
 
-        // uploadFileAsync(file, request) is the correct browser form (confirmed:
-        // it reaches the server). The SDK appends the request's own fields to the
-        // multipart form, so the request must contain ONLY the fields the server
-        // expects — extra keys cause a 500. Send a clean, minimal request.
+        // Mirror the working C# uploader:
+        //   var src = new ByteArrayUploadSource(bytes, fileName);
+        //   var req = new UploadRequest(src, "AssetUploadConfiguration", "NewAsset");
+        //   var resp = await client.Uploads.UploadAsync(req);
+        //   id = LinkHelper.IdFromEntityAsync(resp.Headers.Location);
+        // i.e. uploadAsync(request) with the source EMBEDDED, id from Location.
         const up = client.uploads;
-        const cfgObj = await fetchUploadConfig(cfg.uploadConfiguration);
-        log(`upload config fetch: ${cfgObj ? 'got object (keys=[' + Object.keys(cfgObj).join(',') + '])' : 'not found — using name string'}`, cfgObj ? 'a-info' : 'a-err');
+        const source = makeDuckSource(blob, buffer, img.name);
+        const reqEmbedded = { uploadSource: source, uploadConfiguration: cfg.uploadConfiguration, actionName: cfg.uploadAction };
 
-        const base = { fileName: img.name, fileSize: blob.size, actionName: cfg.uploadAction };
-        const attempts = [];
-        if (cfgObj) {
-          attempts.push(['uploadFileAsync(file, {..., uploadConfiguration:<fetched object>})', () => up.uploadFileAsync(file, Object.assign({}, base, { uploadConfiguration: cfgObj }))]);
-        }
-        attempts.push(['uploadFileAsync(file, {..., uploadConfiguration:{name}})', () => up.uploadFileAsync(file, Object.assign({}, base, { uploadConfiguration: { name: cfg.uploadConfiguration } }))]);
-        attempts.push(['uploadFileAsync(file, {..., uploadConfiguration:name-string})', () => up.uploadFileAsync(file, Object.assign({}, base, { uploadConfiguration: cfg.uploadConfiguration }))]);
+        const attempts = [
+          ['uploadAsync({uploadSource,uploadConfiguration,actionName})', () => up.uploadAsync(reqEmbedded)],
+          // Fallback: the chunked browser helper (reaches the server but 500s on this instance).
+          ['uploadFileAsync(file, {fileName,fileSize,uploadConfiguration,actionName})', () => up.uploadFileAsync(file, { fileName: img.name, fileSize: blob.size, uploadConfiguration: cfg.uploadConfiguration, actionName: cfg.uploadAction })]
+        ];
 
         // Try each form; an upload that 500s before finalization creates nothing,
         // so it's safe to fall through to the next form and collect all errors.
@@ -420,9 +433,20 @@ export default function createExternalRoot(rootElement) {
           throw new Error(`${errs.join('  ||  ')}  ||  ${uploadDiagText || computeUploadDiag()}`);
         }
         if (winningForm !== usedForm) { winningForm = usedForm; log(`✓ upload form that works: ${usedForm}`, 'a-ok'); }
+        log(`upload response: ${safeJson(result)} ; location=${locationFromResponse(result) || '(none)'}`, 'a-info');
 
-        const aid = extractAssetId(result);
-        if (aid == null) throw new Error(`upload ok via ${usedForm} but no asset id returned (result: ${safeJson(result)})`);
+        // Prefer the Location header (like the C# LinkHelper), then fall back to
+        // reading an id off the result body.
+        let aid = idFromLocation(locationFromResponse(result));
+        if (aid == null && client.linkHelper) {
+          const loc = locationFromResponse(result);
+          try {
+            if (loc && typeof client.linkHelper.idFromEntityAsync === 'function') aid = await client.linkHelper.idFromEntityAsync(loc);
+            else if (loc && typeof client.linkHelper.getIdFromEntity === 'function') aid = client.linkHelper.getIdFromEntity(loc);
+          } catch (e) { /* ignore, fall through */ }
+        }
+        if (aid == null) aid = extractAssetId(result);
+        if (aid == null) throw new Error(`upload ok via ${usedForm} but no asset id (result: ${safeJson(result)} ; location: ${locationFromResponse(result)})`);
         return aid;
       }
 
