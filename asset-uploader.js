@@ -28,7 +28,6 @@
 // Uses the authenticated SDK client the External Component receives
 // (context.client). The upload call (client.uploads.uploadAsync) is the one
 // piece that may need adjusting to your instance — its result/error is logged.
-//
 // Configuration (JSON), optional:
 //   {
 //     "skuSeparator": "",                        // if set, SKU = stem before FIRST occurrence of this
