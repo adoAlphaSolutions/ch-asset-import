@@ -48,7 +48,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v3.0 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v3.1 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -541,6 +541,31 @@ export default function createExternalRoot(rootElement) {
         return aid;
       }
 
+      // Force-load a relation via the SDK. The key is MemberLoadOption.LazyLoading
+      // (the 3rd arg of getRelationAsync) — without it the SDK does no IO and
+      // reports "not loaded". We try the likely numeric enum values, then plain.
+      async function loadRel(entity, name) {
+        let lastErr = null;
+        if (typeof entity.getRelationAsync === 'function') {
+          const argSets = [[name, undefined, 1], [name, undefined, 2], [name, undefined, 0], [name]];
+          for (const args of argSets) {
+            try { const r = await entity.getRelationAsync.apply(entity, args); if (r) return r; }
+            catch (e) { lastErr = e; }
+          }
+        }
+        try { const r = entity.getRelation(name); if (r) return r; } catch (e) { lastErr = lastErr || e; }
+        if (lastErr) throw new Error(`loadRel('${name}'): ${lastErr.message || lastErr}`);
+        return null;
+      }
+      function relIds(rel) {
+        try { if (typeof rel.getIds === 'function') { const v = rel.getIds(); if (Array.isArray(v)) return v.slice(); } } catch (e) { /* ignore */ }
+        return relGetIds(rel);
+      }
+      function relSet(rel, ids) {
+        if (typeof rel.setIds === 'function') { rel.setIds(ids); return; }
+        relSetIds(rel, ids);
+      }
+
       // Get a relation, lazy-loading it if the entity was fetched without it.
       // Surfaces the real error (instead of hiding it) so we can see WHY a
       // relation won't resolve, and also tries loadRelationsAsync.
@@ -625,15 +650,20 @@ export default function createExternalRoot(rootElement) {
       async function setAssetType(assetId, isCover) {
         const identifier = isCover ? cfg.coverAssetType : cfg.stockAssetType;
         const typeId = await assetTypeId(identifier);
+        const asset = await client.entities.getAsync(assetId);
         // AssetTypeToAsset: asset is CHILD of M.AssetType -> set the single parent.
-        await restSetParent(assetId, cfg.assetTypeRelation, typeId, log);
+        const rel = await loadRel(asset, cfg.assetTypeRelation);
+        if (!rel) throw new Error(`relation ${cfg.assetTypeRelation} could not be loaded on asset`);
+        relSet(rel, [typeId]);
 
         if (cfg.setLifecycle && cfg.lifecycleStatus) {
           try {
             const lcId = await assetTypeId(cfg.lifecycleStatus);   // resolves identifier -> id (cached)
-            await restSetParent(assetId, cfg.lifecycleRelation, lcId, log);
+            const lc = await loadRel(asset, cfg.lifecycleRelation);
+            if (lc) relSet(lc, [lcId]);
           } catch (e) { /* lifecycle is best-effort */ }
         }
+        await client.entities.saveAsync(asset);
         return identifier;
       }
 
@@ -656,15 +686,22 @@ export default function createExternalRoot(rootElement) {
       // product has no master/cover yet, also set this asset as the cover.
       // Returns { master: true } when the asset was set as the cover.
       async function linkAssetToProduct(assetId, productId) {
-        // 1) all-assets (product is parent, asset is child) — REST add, skips dups
-        await restAddChild(productId, cfg.allAssetsRelation, assetId, log);
+        const product = await client.entities.getAsync(productId);
+
+        // 1) all-assets (product is parent, asset is child) — append, skip dups
+        const all = await loadRel(product, cfg.allAssetsRelation);
+        if (!all) throw new Error(`relation ${cfg.allAssetsRelation} could not be loaded on product`);
+        const ids = relIds(all);
+        if (ids.indexOf(assetId) < 0) { ids.push(assetId); relSet(all, ids); }
 
         // 2) master/cover — only if the product has none yet (single asset)
         let master = false;
         if (cfg.setMasterIfEmpty) {
-          const cnt = await restChildCount(productId, cfg.masterAssetRelation);
-          if (cnt === 0) { await restAddChild(productId, cfg.masterAssetRelation, assetId, log); master = true; }
+          const cover = await loadRel(product, cfg.masterAssetRelation);
+          if (cover && relIds(cover).length === 0) { relSet(cover, [assetId]); master = true; }
         }
+
+        await client.entities.saveAsync(product);
         return { master };
       }
 
