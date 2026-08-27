@@ -48,7 +48,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v2.5 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v2.6 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -467,6 +467,15 @@ export default function createExternalRoot(rootElement) {
         return aid;
       }
 
+      // Get a relation, lazy-loading it if the entity was fetched without it
+      // (getRelationAsync loads on demand; getRelation only works if preloaded).
+      async function getRel(entity, name) {
+        if (entity && typeof entity.getRelationAsync === 'function') {
+          try { const r = await entity.getRelationAsync(name); if (r) return r; } catch (e) { /* fall through */ }
+        }
+        try { return entity.getRelation(name); } catch (e) { return null; }
+      }
+
       // Read the ids currently in a relation, across possible SDK shapes.
       function relGetIds(rel) {
         if (!rel) return [];
@@ -529,13 +538,13 @@ export default function createExternalRoot(rootElement) {
         const identifier = isCover ? cfg.coverAssetType : cfg.stockAssetType;
         const typeId = await assetTypeId(identifier);
         const asset = await client.entities.getAsync(assetId);
-        const rel = asset.getRelation(cfg.assetTypeRelation);
+        const rel = await getRel(asset, cfg.assetTypeRelation);
         if (!rel) throw new Error(`relation ${cfg.assetTypeRelation} not found on asset`);
         relSetIds(rel, [typeId]);   // single type; replace rather than append
 
         if (cfg.setLifecycle && cfg.lifecycleStatus) {
           try {
-            const lc = asset.getRelation(cfg.lifecycleRelation);
+            const lc = await getRel(asset, cfg.lifecycleRelation);
             if (lc && typeof lc.setIdentifiersAsync === 'function') await lc.setIdentifiersAsync([cfg.lifecycleStatus]);
             else if (lc) { const st = await client.entities.getAsync(cfg.lifecycleStatus); if (st && st.id != null) relSetIds(lc, [st.id]); }
           } catch (e) { /* lifecycle is best-effort */ }
@@ -566,14 +575,14 @@ export default function createExternalRoot(rootElement) {
         const product = await client.entities.getAsync(productId);
 
         // 1) all-assets (product is parent, asset is child) — skip if already present
-        const all = product.getRelation(cfg.allAssetsRelation);
+        const all = await getRel(product, cfg.allAssetsRelation);
         if (!all) throw new Error(`relation ${cfg.allAssetsRelation} not found on product`);
         if (relGetIds(all).indexOf(assetId) < 0) relAdd(all, assetId);
 
         // 2) master/cover — only if empty (single asset allowed)
         let master = false;
         if (cfg.setMasterIfEmpty) {
-          const cover = product.getRelation(cfg.masterAssetRelation);
+          const cover = await getRel(product, cfg.masterAssetRelation);
           if (cover && relGetIds(cover).length === 0) { relAdd(cover, assetId); master = true; }
         }
 
