@@ -44,7 +44,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v1.9 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v2.0 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -354,10 +354,25 @@ export default function createExternalRoot(rootElement) {
       function computeUploadDiag() {
         let keys = '?'; try { keys = Object.keys(client.uploads).join(','); } catch (e) { /* ignore */ }
         let proto = '?'; try { proto = Object.getOwnPropertyNames(Object.getPrototypeOf(client.uploads)).filter(n => n !== 'constructor').join(','); } catch (e) { /* ignore */ }
+        let ckeys = '?'; try { ckeys = Object.keys(client).join(','); } catch (e) { /* ignore */ }
+        let cproto = '?'; try { cproto = Object.getOwnPropertyNames(Object.getPrototypeOf(client)).filter(n => n !== 'constructor').join(','); } catch (e) { /* ignore */ }
         const has = n => !!findCtor([n]);
         uploadDiagText = `uploads.keys=[${keys}] uploads.methods=[${proto}] uploadAsync.arity=${client.uploads.uploadAsync.length} ` +
+          `client.keys=[${ckeys}] client.methods=[${cproto}] ` +
           `real={UploadRequest:${has('UploadRequest')},BlobUploadSource:${has('BlobUploadSource')},ArrayBufferUploadSource:${has('ArrayBufferUploadSource')}}`;
         return uploadDiagText;
+      }
+      // Try to fetch the real UploadConfiguration object (carries chunk size etc.)
+      // from whichever manager the client exposes. Returns the object or null.
+      async function fetchUploadConfig(name) {
+        const managers = ['uploadConfigurations', 'uploadConfiguration', 'settings'];
+        for (const m of managers) {
+          const mgr = client[m];
+          if (mgr && typeof mgr.getAsync === 'function') {
+            try { const c = await mgr.getAsync(name); if (c) return c; } catch (e) { /* try next */ }
+          }
+        }
+        return null;
       }
       function logUploadDiag() {
         if (uploadDiagDone) return; uploadDiagDone = true;
@@ -380,14 +395,17 @@ export default function createExternalRoot(rootElement) {
         // it reaches the server). The SDK appends the request's own fields to the
         // multipart form, so the request must contain ONLY the fields the server
         // expects — extra keys cause a 500. Send a clean, minimal request.
-        const reqFull = { fileName: img.name, fileSize: blob.size, uploadConfiguration: cfg.uploadConfiguration, actionName: cfg.uploadAction };
-        const reqNoAction = { fileName: img.name, fileSize: blob.size, uploadConfiguration: cfg.uploadConfiguration };
         const up = client.uploads;
+        const cfgObj = await fetchUploadConfig(cfg.uploadConfiguration);
+        log(`upload config fetch: ${cfgObj ? 'got object (keys=[' + Object.keys(cfgObj).join(',') + '])' : 'not found — using name string'}`, cfgObj ? 'a-info' : 'a-err');
 
-        const attempts = [
-          ['uploadFileAsync(file, {fileName,fileSize,uploadConfiguration,actionName})', () => up.uploadFileAsync(file, reqFull)],
-          ['uploadFileAsync(file, {fileName,fileSize,uploadConfiguration})', () => up.uploadFileAsync(file, reqNoAction)]
-        ];
+        const base = { fileName: img.name, fileSize: blob.size, actionName: cfg.uploadAction };
+        const attempts = [];
+        if (cfgObj) {
+          attempts.push(['uploadFileAsync(file, {..., uploadConfiguration:<fetched object>})', () => up.uploadFileAsync(file, Object.assign({}, base, { uploadConfiguration: cfgObj }))]);
+        }
+        attempts.push(['uploadFileAsync(file, {..., uploadConfiguration:{name}})', () => up.uploadFileAsync(file, Object.assign({}, base, { uploadConfiguration: { name: cfg.uploadConfiguration } }))]);
+        attempts.push(['uploadFileAsync(file, {..., uploadConfiguration:name-string})', () => up.uploadFileAsync(file, Object.assign({}, base, { uploadConfiguration: cfg.uploadConfiguration }))]);
 
         // Try each form; an upload that 500s before finalization creates nothing,
         // so it's safe to fall through to the next form and collect all errors.
