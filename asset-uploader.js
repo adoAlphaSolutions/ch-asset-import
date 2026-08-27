@@ -48,7 +48,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v3.4 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v3.5 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -72,10 +72,12 @@ const DEFAULTS = {
   businessUnitRelation: 'BusinessUnitToAsset',
   businessUnitDef: 'TB.BusinessUnit',
   businessUnitLabel: 'Not Applicable',
-  businessUnitId: null,
+  businessUnitIdentifier: null,   // e.g. "TB.BusinessUnit.Not_Applicable"
+  businessUnitId: null,           // numeric id (most reliable)
   assetBusinessUnitRelation: 'AssetBusinessUnitToAsset',
   assetBusinessUnitDef: 'TB.AssetBusinessUnit',
   assetBusinessUnitLabel: 'Not Applicable',
+  assetBusinessUnitIdentifier: null,
   assetBusinessUnitId: null,
   uploadConfiguration: 'AssetUploadConfiguration',
   uploadAction: 'NewAsset',
@@ -626,6 +628,24 @@ export default function createExternalRoot(rootElement) {
         throw new Error('could not set ids on relation (unknown relation API)');
       }
 
+      // Resolve a required taxonomy member to an id, preferring calls that work
+      // even when the bulk query API is blocked (403): explicit id, then
+      // getAsync(identifier) with sensible guesses, then a label query.
+      async function resolveMember(idCfg, identifierCfg, def, label) {
+        if (idCfg != null) return Number(idCfg);
+        const idents = [];
+        if (identifierCfg) idents.push(identifierCfg);
+        if (label) {
+          idents.push(`${def}.${String(label).trim().replace(/\s+/g, '_')}`);   // TB.BusinessUnit.Not_Applicable
+          idents.push(`${def}.${String(label).trim().replace(/\s+/g, '')}`);    // TB.BusinessUnit.NotApplicable
+        }
+        for (const id of idents) {
+          try { const ent = await client.entities.getAsync(id); if (ent && ent.id != null) return ent.id; } catch (e) { /* try next */ }
+        }
+        try { const r = await resolveByLabel(def, label); if (r != null) return r; } catch (e) { /* query may 403 */ }
+        return null;
+      }
+
       // Resolve a taxonomy item id by definition + label (e.g. TB.BusinessUnit /
       // "Not Applicable"), mirroring the C# GetCachedTaxonomy lookup. Cached.
       async function resolveByLabel(defName, label) {
@@ -706,15 +726,13 @@ export default function createExternalRoot(rootElement) {
             const cr = await loadRel(asset, cfg.creatorRelation);
             if (cr) relSet(cr, [Number(cfg.creatorId)]);
           }
-          const buId = cfg.businessUnitId != null ? Number(cfg.businessUnitId)
-            : await resolveByLabel(cfg.businessUnitDef, cfg.businessUnitLabel);
-          if (buId != null) {
-            const bu = await loadRel(asset, cfg.businessUnitRelation);
-            if (bu) relSet(bu, [Number(buId)]);
-          }
+          const buId = await resolveMember(cfg.businessUnitId, cfg.businessUnitIdentifier, cfg.businessUnitDef, cfg.businessUnitLabel);
+          if (buId == null) throw new Error(`could not resolve Business Unit (${cfg.businessUnitDef} "${cfg.businessUnitLabel}") — set businessUnitId or businessUnitIdentifier in the config`);
+          const bu = await loadRel(asset, cfg.businessUnitRelation);
+          if (bu) relSet(bu, [Number(buId)]);
+
           try {
-            const abuId = cfg.assetBusinessUnitId != null ? Number(cfg.assetBusinessUnitId)
-              : await resolveByLabel(cfg.assetBusinessUnitDef, cfg.assetBusinessUnitLabel);
+            const abuId = await resolveMember(cfg.assetBusinessUnitId, cfg.assetBusinessUnitIdentifier, cfg.assetBusinessUnitDef, cfg.assetBusinessUnitLabel);
             if (abuId != null) {
               const abu = await loadRel(asset, cfg.assetBusinessUnitRelation);
               if (abu) relSet(abu, [Number(abuId)]);
