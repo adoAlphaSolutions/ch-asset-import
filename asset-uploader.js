@@ -48,7 +48,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v2.6 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v2.7 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -467,13 +467,27 @@ export default function createExternalRoot(rootElement) {
         return aid;
       }
 
-      // Get a relation, lazy-loading it if the entity was fetched without it
-      // (getRelationAsync loads on demand; getRelation only works if preloaded).
+      // Get a relation, lazy-loading it if the entity was fetched without it.
+      // Surfaces the real error (instead of hiding it) so we can see WHY a
+      // relation won't resolve, and also tries loadRelationsAsync.
       async function getRel(entity, name) {
-        if (entity && typeof entity.getRelationAsync === 'function') {
-          try { const r = await entity.getRelationAsync(name); if (r) return r; } catch (e) { /* fall through */ }
+        // 1. already loaded?
+        try { const r0 = entity.getRelation(name); if (r0) return r0; } catch (e) { /* not loaded yet */ }
+        let firstErr = null;
+        // 2. lazy-load the single relation (let a real error propagate)
+        if (typeof entity.getRelationAsync === 'function') {
+          try { const r = await entity.getRelationAsync(name); if (r) return r; }
+          catch (e) { firstErr = e; }
         }
-        try { return entity.getRelation(name); } catch (e) { return null; }
+        // 3. explicit load, then sync get (try a couple of arg shapes)
+        if (typeof entity.loadRelationsAsync === 'function') {
+          for (const arg of [name, [name]]) {
+            try { await entity.loadRelationsAsync(arg); const r2 = entity.getRelation(name); if (r2) return r2; }
+            catch (e) { firstErr = firstErr || e; }
+          }
+        }
+        if (firstErr) throw new Error(`getRelationAsync('${name}') failed: ${firstErr.message || firstErr}`);
+        return null;
       }
 
       // Read the ids currently in a relation, across possible SDK shapes.
