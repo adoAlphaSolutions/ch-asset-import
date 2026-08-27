@@ -28,6 +28,7 @@
 // Uses the authenticated SDK client the External Component receives
 // (context.client). The upload call (client.uploads.uploadAsync) is the one
 // piece that may need adjusting to your instance — its result/error is logged.
+//
 // Configuration (JSON), optional:
 //   {
 //     "skuSeparator": "",                        // if set, SKU = stem before FIRST occurrence of this
@@ -47,7 +48,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v3.3 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v3.4 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -64,6 +65,18 @@ const DEFAULTS = {
   lifecycleRelation: 'FinalLifeCycleStatusToAsset',
   lifecycleStatus: 'M.Final.LifeCycle.Status.Approved',
   setLifecycle: true,
+  // Required M.Asset members on this instance (mirrors the C# import).
+  setRequiredMembers: true,
+  creatorRelation: 'CreatorToAsset',
+  creatorId: 2689796,
+  businessUnitRelation: 'BusinessUnitToAsset',
+  businessUnitDef: 'TB.BusinessUnit',
+  businessUnitLabel: 'Not Applicable',
+  businessUnitId: null,
+  assetBusinessUnitRelation: 'AssetBusinessUnitToAsset',
+  assetBusinessUnitDef: 'TB.AssetBusinessUnit',
+  assetBusinessUnitLabel: 'Not Applicable',
+  assetBusinessUnitId: null,
   uploadConfiguration: 'AssetUploadConfiguration',
   uploadAction: 'NewAsset',
   attachFile: true
@@ -613,6 +626,29 @@ export default function createExternalRoot(rootElement) {
         throw new Error('could not set ids on relation (unknown relation API)');
       }
 
+      // Resolve a taxonomy item id by definition + label (e.g. TB.BusinessUnit /
+      // "Not Applicable"), mirroring the C# GetCachedTaxonomy lookup. Cached.
+      async function resolveByLabel(defName, label) {
+        const key = defName + '::' + label;
+        if (assetTypeIdCache.has(key)) return assetTypeIdCache.get(key);
+        const chql = `Definition.Name=='${defName}'`;
+        const url = `${CH_HOST}/api/entities/query?query=${encodeURIComponent(chql)}&members=Label,Identifier&take=500`;
+        const res = await fetch(url, { credentials: 'include', headers: { Accept: 'application/json' } });
+        if (!res.ok) throw new Error(`resolve ${defName} HTTP ${res.status}`);
+        const items = ((await res.json()) || {}).items || [];
+        const want = String(label).trim().toLowerCase();
+        let found = null;
+        for (const it of items) {
+          const lbl = readProp(it, 'Label');
+          const ident = String(it.identifier || '');
+          if ((lbl && String(lbl).trim().toLowerCase() === want) ||
+            ident.toLowerCase() === (`${defName}.${label}`).replace(/\s+/g, '_').toLowerCase()) { found = itemId(it); break; }
+        }
+        if (found == null && items.length === 1) found = itemId(items[0]);
+        if (found != null) assetTypeIdCache.set(key, found);
+        return found;
+      }
+
       // Resolve an M.AssetType taxonomy identifier -> entity id (cached per session).
       async function assetTypeId(identifier) {
         if (assetTypeIdCache.has(identifier)) return assetTypeIdCache.get(identifier);
@@ -663,6 +699,29 @@ export default function createExternalRoot(rootElement) {
             if (lc) relSet(lc, [lcId]);
           } catch (e) { /* lifecycle is best-effort */ }
         }
+
+        // Required members on this instance: Creator + Business Unit (mirrors C#).
+        if (cfg.setRequiredMembers) {
+          if (cfg.creatorId) {
+            const cr = await loadRel(asset, cfg.creatorRelation);
+            if (cr) relSet(cr, [Number(cfg.creatorId)]);
+          }
+          const buId = cfg.businessUnitId != null ? Number(cfg.businessUnitId)
+            : await resolveByLabel(cfg.businessUnitDef, cfg.businessUnitLabel);
+          if (buId != null) {
+            const bu = await loadRel(asset, cfg.businessUnitRelation);
+            if (bu) relSet(bu, [Number(buId)]);
+          }
+          try {
+            const abuId = cfg.assetBusinessUnitId != null ? Number(cfg.assetBusinessUnitId)
+              : await resolveByLabel(cfg.assetBusinessUnitDef, cfg.assetBusinessUnitLabel);
+            if (abuId != null) {
+              const abu = await loadRel(asset, cfg.assetBusinessUnitRelation);
+              if (abu) relSet(abu, [Number(abuId)]);
+            }
+          } catch (e) { /* AssetBusinessUnit is optional */ }
+        }
+
         try { await client.entities.saveAsync(asset); }
         catch (e) { throw new Error(`asset save failed — ${errDetail(e)}`); }
         return identifier;
