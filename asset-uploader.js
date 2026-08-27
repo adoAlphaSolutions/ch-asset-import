@@ -44,7 +44,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v2.0 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v2.1 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -355,10 +355,11 @@ export default function createExternalRoot(rootElement) {
         let keys = '?'; try { keys = Object.keys(client.uploads).join(','); } catch (e) { /* ignore */ }
         let proto = '?'; try { proto = Object.getOwnPropertyNames(Object.getPrototypeOf(client.uploads)).filter(n => n !== 'constructor').join(','); } catch (e) { /* ignore */ }
         let ckeys = '?'; try { ckeys = Object.keys(client).join(','); } catch (e) { /* ignore */ }
-        let cproto = '?'; try { cproto = Object.getOwnPropertyNames(Object.getPrototypeOf(client)).filter(n => n !== 'constructor').join(','); } catch (e) { /* ignore */ }
+        const mgrMethods = m => { try { return Object.getOwnPropertyNames(Object.getPrototypeOf(client[m])).filter(n => n !== 'constructor').join(','); } catch (e) { return '?'; } };
         const has = n => !!findCtor([n]);
-        uploadDiagText = `uploads.keys=[${keys}] uploads.methods=[${proto}] uploadAsync.arity=${client.uploads.uploadAsync.length} ` +
-          `client.keys=[${ckeys}] client.methods=[${cproto}] ` +
+        uploadDiagText = `uploads.methods=[${proto}] uploadAsync.arity=${client.uploads.uploadAsync.length} ` +
+          `assets.methods=[${mgrMethods('assets')}] settings.methods=[${mgrMethods('settings')}] ` +
+          `client.keys=[${ckeys}] ` +
           `real={UploadRequest:${has('UploadRequest')},BlobUploadSource:${has('BlobUploadSource')},ArrayBufferUploadSource:${has('ArrayBufferUploadSource')}}`;
         return uploadDiagText;
       }
