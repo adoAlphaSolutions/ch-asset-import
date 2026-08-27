@@ -48,7 +48,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v2.9 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v3.0 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -181,35 +181,42 @@ async function restGetRelation(entityId, name) {
   if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`GET relation ${name} HTTP ${res.status}${t ? ' — ' + t.slice(0, 160) : ''}`); }
   return await res.json();
 }
-async function restRawPut(entityId, name, body) {
-  const res = await fetch(`${CH_HOST}/api/entities/${entityId}/relations/${encodeURIComponent(name)}`, {
+async function restGetEntity(id) {
+  const res = await fetch(`${CH_HOST}/api/entities/${id}`, { credentials: 'include', headers: { Accept: 'application/json' } });
+  if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`GET entity ${id} HTTP ${res.status}${t ? ' — ' + t.slice(0, 160) : ''}`); }
+  return await res.json();
+}
+async function restPutEntity(id, body) {
+  const res = await fetch(`${CH_HOST}/api/entities/${id}`, {
     method: 'PUT', credentials: 'include',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify(body)
   });
-  if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`HTTP ${res.status}${t ? ' — ' + t.slice(0, 160) : ''}`); }
+  if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`HTTP ${res.status}${t ? ' — ' + t.slice(0, 300) : ''}`); }
   return true;
 }
-// PUT a relation side ('children' or 'parents') with the given ids, trying the
-// body shapes CH may accept. `dbg` (optional) logs the GET shape + winning form.
+// Update a relation side via ENTITY-level PUT (/api/entities/{id}) with the
+// version + a relations block. Tries the member shapes CH may accept.
 async function restSetMembers(entityId, name, side, ids, dbg) {
+  const ent = await restGetEntity(entityId);
+  const ver = ent.version != null ? ent.version : (ent.entity && ent.entity.version);
+  const mk = (members) => { const b = { relations: { [name]: { [side]: members } } }; if (ver != null) b.version = ver; return b; };
   const variants = [
-    [`${side}:hrefs`, { [side]: ids.map(id => ({ href: entHref(id) })) }],
-    [`${side}:ids`, { [side]: ids.slice() }],
-    [`${side}:id-objs`, { [side]: ids.map(id => ({ id })) }],
-    [`${side}:self-hrefs`, { [side]: ids.map(id => ({ self: { href: entHref(id) } })) }]
+    [`${side}:hrefs`, mk(ids.map(id => ({ href: entHref(id) })))],
+    [`${side}:ids`, mk(ids.slice())],
+    [`${side}:id-objs`, mk(ids.map(id => ({ id })))]
   ];
   const errs = [];
   for (const [label, body] of variants) {
-    try { await restRawPut(entityId, name, body); if (dbg && relPutOkLabel !== label) { relPutOkLabel = label; dbg(`relation PUT format that works: ${label}`, 'a-ok'); } return; }
+    try { await restPutEntity(entityId, body); if (dbg && relPutOkLabel !== label) { relPutOkLabel = label; dbg(`relation write format that works: ${label}`, 'a-ok'); } return; }
     catch (e) { errs.push(`${label}→${e.message}`); }
   }
-  throw new Error(`PUT relation ${name} failed all formats: ${errs.join(' | ')}`);
+  throw new Error(`entity PUT for ${name} failed all formats: ${errs.join(' | ')}`);
 }
 // Add a child to a parent-side relation (product -> assets). Skips duplicates.
 async function restAddChild(parentId, name, childId, dbg) {
   const rel = await restGetRelation(parentId, name);
-  if (dbg) dbg(`GET ${name}: ${JSON.stringify(rel).slice(0, 500)}`, 'a-info');
+  if (dbg) dbg(`GET ${name}: ${JSON.stringify(rel).slice(0, 400)}`, 'a-info');
   const ids = memberIds(rel.children);
   if (ids.indexOf(Number(childId)) >= 0) return;
   ids.push(Number(childId));
