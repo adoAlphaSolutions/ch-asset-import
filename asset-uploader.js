@@ -44,7 +44,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v1.6 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v1.7 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -150,6 +150,16 @@ function findCtor(names) {
 }
 
 function safeJson(v) { try { return JSON.stringify(v).slice(0, 240); } catch (e) { return String(v); } }
+// Pull as much detail as possible out of an SDK/HTTP error for diagnostics.
+function errDetail(e) {
+  if (!e) return '';
+  const parts = [e.message || String(e)];
+  for (const k of ['detail', 'title', 'body', 'responseText', 'data', 'error', 'innerException']) {
+    try { if (e[k] != null) parts.push(`${k}=${typeof e[k] === 'object' ? safeJson(e[k]) : String(e[k]).slice(0, 200)}`); } catch (_) { /* ignore */ }
+  }
+  try { const ks = Object.keys(e); if (ks.length) parts.push(`ekeys=[${ks.join(',')}]`); } catch (_) { /* ignore */ }
+  return parts.join(' ; ');
+}
 function extractAssetId(r) {
   if (r == null) return null;
   if (typeof r === 'number') return r;
@@ -351,38 +361,30 @@ export default function createExternalRoot(rootElement) {
         const file = (typeof File === 'function') ? new File([blob], img.name, { type: blob.type }) : blob;
         const source = makeDuckSource(blob, buffer, img.name);
 
-        // uploadAsync arity is 2 => (request, source). Build the request metadata
-        // both with the config as a string and as { name } (we don't know which
-        // the SDK guards want), and try the browser-friendly uploadFileAsync too.
-        const metaStr = { fileName: img.name, fileSize: blob.size, uploadConfiguration: cfg.uploadConfiguration, actionName: cfg.uploadAction, action: cfg.uploadAction };
-        const metaObj = { fileName: img.name, fileSize: blob.size, uploadConfiguration: { name: cfg.uploadConfiguration }, actionName: cfg.uploadAction, action: cfg.uploadAction };
+        // uploadFileAsync(file, request) is the correct browser form (confirmed:
+        // it reaches the server). The SDK appends the request's own fields to the
+        // multipart form, so the request must contain ONLY the fields the server
+        // expects — extra keys cause a 500. Send a clean, minimal request.
+        const reqFull = { fileName: img.name, fileSize: blob.size, uploadConfiguration: cfg.uploadConfiguration, actionName: cfg.uploadAction };
+        const reqNoAction = { fileName: img.name, fileSize: blob.size, uploadConfiguration: cfg.uploadConfiguration };
         const up = client.uploads;
 
-        const attempts = [];
-        if (typeof up.uploadFileAsync === 'function') {
-          attempts.push(['uploadFileAsync(file, metaStr)', () => up.uploadFileAsync(file, metaStr)]);
-          attempts.push(['uploadFileAsync(file, metaObj)', () => up.uploadFileAsync(file, metaObj)]);
-        }
-        attempts.push(['uploadAsync(metaStr, source)', () => up.uploadAsync(metaStr, source)]);
-        attempts.push(['uploadAsync(metaObj, source)', () => up.uploadAsync(metaObj, source)]);
+        const attempts = [
+          ['uploadFileAsync(file, {fileName,fileSize,uploadConfiguration,actionName})', () => up.uploadFileAsync(file, reqFull)],
+          ['uploadFileAsync(file, {fileName,fileSize,uploadConfiguration})', () => up.uploadFileAsync(file, reqNoAction)],
+          ['uploadAsync({...,actionName}, source)', () => up.uploadAsync(reqFull, source)]
+        ];
 
-        // A pre-flight (synchronous/arg) failure is safe to retry with the next
-        // form; a server-side failure is NOT (it may have created something), so
-        // we surface it immediately.
-        const preflight = /should not be null|is not a function|cannot read propert|is not defined|is not a constructor|expected .* argument/i;
-
-        let result, usedForm, lastMsg = '';
+        // Try each form; an upload that 500s before finalization creates nothing,
+        // so it's safe to fall through to the next form and collect all errors.
+        let result, usedForm;
+        const errs = [];
         for (const [name, fn] of attempts) {
           try { result = await fn(); usedForm = name; break; }
-          catch (e) {
-            lastMsg = e && e.message ? e.message : String(e);
-            if (!preflight.test(lastMsg)) {
-              throw new Error(`[${name}] ${lastMsg}  ||  ${uploadDiagText || computeUploadDiag()}`);
-            }
-          }
+          catch (e) { errs.push(`[${name}] ${errDetail(e)}`); }
         }
         if (usedForm == null) {
-          throw new Error(`[all-forms-failed] ${lastMsg}  ||  ${uploadDiagText || computeUploadDiag()}`);
+          throw new Error(`${errs.join('  ||  ')}  ||  ${uploadDiagText || computeUploadDiag()}`);
         }
         if (winningForm !== usedForm) { winningForm = usedForm; log(`✓ upload form that works: ${usedForm}`, 'a-ok'); }
 
