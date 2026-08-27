@@ -39,12 +39,16 @@
 //     "assetTypeRelation": "AssetTypeToAsset",   // M.Asset is child of M.AssetType
 //     "stockAssetType": "M.AssetType.PIMProduct.Stock",  // non-cover assets
 //     "coverAssetType": "M.AssetType.Thumbnail",         // the cover asset
+//     "lifecycleRelation": "FinalLifeCycleStatusToAsset",
+//     "lifecycleStatus": "M.Final.LifeCycle.Status.Approved",
+//     "setLifecycle": true,
 //     "uploadConfiguration": "AssetUploadConfiguration",
-//     "uploadAction": "NewAsset"
+//     "uploadAction": "NewAsset",
+//     "attachFile": true                          // also push the image binary (needs M.UploadConfiguration Read)
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v2.3 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v2.5 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -58,8 +62,12 @@ const DEFAULTS = {
   assetTypeRelation: 'AssetTypeToAsset',
   stockAssetType: 'M.AssetType.PIMProduct.Stock',
   coverAssetType: 'M.AssetType.Thumbnail',
+  lifecycleRelation: 'FinalLifeCycleStatusToAsset',
+  lifecycleStatus: 'M.Final.LifeCycle.Status.Approved',
+  setLifecycle: true,
   uploadConfiguration: 'AssetUploadConfiguration',
-  uploadAction: 'NewAsset'
+  uploadAction: 'NewAsset',
+  attachFile: true
 };
 const IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'tif', 'tiff', 'webp', 'svg', 'heic', 'heif']);
 
@@ -419,10 +427,14 @@ export default function createExternalRoot(rootElement) {
         // so set that primarily; keep uploadSource as an alias just in case.
         const reqEmbedded = { source: source, uploadSource: source, uploadConfiguration: cfg.uploadConfiguration, actionName: cfg.uploadAction, fileName: img.name, fileSize: blob.size };
 
+        // uploadFileAsync is the sanctioned browser method (chunks a File and reaches
+        // the server). A 500 here is most likely a PERMISSION issue: the signed-in
+        // user needs Read on the M.UploadConfiguration definition (per Sitecore docs).
+        // uploadAsync(request) is kept as a fallback but needs SDK classes this
+        // runtime doesn't expose, so it can't be fully satisfied by a hand-built object.
         const attempts = [
-          ['uploadAsync({source,uploadConfiguration,actionName})', () => up.uploadAsync(reqEmbedded)],
-          // Fallback: the chunked browser helper (reaches the server but 500s on this instance).
-          ['uploadFileAsync(file, {fileName,fileSize,uploadConfiguration,actionName})', () => up.uploadFileAsync(file, { fileName: img.name, fileSize: blob.size, uploadConfiguration: cfg.uploadConfiguration, actionName: cfg.uploadAction })]
+          ['uploadFileAsync(file, {fileName,fileSize,uploadConfiguration,actionName})', () => up.uploadFileAsync(file, { fileName: img.name, fileSize: blob.size, uploadConfiguration: cfg.uploadConfiguration, actionName: cfg.uploadAction })],
+          ['uploadAsync({source,uploadConfiguration,actionName})', () => up.uploadAsync(reqEmbedded)]
         ];
 
         // Try each form; an upload that 500s before finalization creates nothing,
@@ -434,7 +446,8 @@ export default function createExternalRoot(rootElement) {
           catch (e) { errs.push(`[${name}] ${errDetail(e)}`); }
         }
         if (usedForm == null) {
-          throw new Error(`${errs.join('  ||  ')}  ||  ${uploadDiagText || computeUploadDiag()}`);
+          const hint = /500/.test(errs.join(' ')) ? '  ||  HINT: a 500 on uploadFileAsync usually means the signed-in user lacks Read permission on the M.UploadConfiguration definition.' : '';
+          throw new Error(`${errs.join('  ||  ')}${hint}  ||  ${uploadDiagText || computeUploadDiag()}`);
         }
         if (winningForm !== usedForm) { winningForm = usedForm; log(`✓ upload form that works: ${usedForm}`, 'a-ok'); }
         log(`upload response: ${safeJson(result)} ; location=${locationFromResponse(result) || '(none)'}`, 'a-info');
@@ -488,8 +501,30 @@ export default function createExternalRoot(rootElement) {
         return id;
       }
 
-      // Set the asset's type via AssetTypeToAsset (asset is CHILD of M.AssetType).
-      // Cover -> coverAssetType (Thumbnail); otherwise -> stockAssetType (Stock).
+      // Create the M.Asset ENTITY using the same proven path as the Division
+      // staging rows (entityFactory.createAsync + entities.saveAsync). This is a
+      // metadata write and does NOT need the upload pipeline. Returns the new id.
+      async function createAssetEntity(img) {
+        const culture = context && context.culture;
+        const attempts = [
+          () => client.entityFactory.createAsync('M.Asset'),
+          () => client.entityFactory.createAsync('M.Asset', culture),
+          () => client.entityFactory.createAsync('M.Asset', [culture])
+        ];
+        let asset, lastErr;
+        for (const a of attempts) { try { asset = await a(); if (asset) break; } catch (e) { lastErr = e; } }
+        if (!asset) throw new Error(`createAsync(M.Asset) failed: ${lastErr && lastErr.message ? lastErr.message : lastErr}`);
+        try { asset.setPropertyValue('FileName', img.name); } catch (e) { /* ignore */ }
+        try { asset.setPropertyValue('Title', stripExt(img.name)); } catch (e) { /* ignore */ }
+        const saved = await client.entities.saveAsync(asset);
+        const id = (typeof saved === 'number') ? saved : ((saved && (saved.id || saved.Id)) || asset.id || extractAssetId(saved));
+        if (id == null) throw new Error('asset entity created but no id returned');
+        return id;
+      }
+
+      // Set the asset's type (AssetTypeToAsset, asset is CHILD of M.AssetType) and,
+      // optionally, its final lifecycle status. Cover -> coverAssetType (Thumbnail);
+      // otherwise -> stockAssetType (Stock).
       async function setAssetType(assetId, isCover) {
         const identifier = isCover ? cfg.coverAssetType : cfg.stockAssetType;
         const typeId = await assetTypeId(identifier);
@@ -497,8 +532,31 @@ export default function createExternalRoot(rootElement) {
         const rel = asset.getRelation(cfg.assetTypeRelation);
         if (!rel) throw new Error(`relation ${cfg.assetTypeRelation} not found on asset`);
         relSetIds(rel, [typeId]);   // single type; replace rather than append
+
+        if (cfg.setLifecycle && cfg.lifecycleStatus) {
+          try {
+            const lc = asset.getRelation(cfg.lifecycleRelation);
+            if (lc && typeof lc.setIdentifiersAsync === 'function') await lc.setIdentifiersAsync([cfg.lifecycleStatus]);
+            else if (lc) { const st = await client.entities.getAsync(cfg.lifecycleStatus); if (st && st.id != null) relSetIds(lc, [st.id]); }
+          } catch (e) { /* lifecycle is best-effort */ }
+        }
         await client.entities.saveAsync(asset);
         return identifier;
+      }
+
+      // Attach the image binary to an EXISTING asset via the upload pipeline
+      // (action NewMainFile + AssetId), mirroring the C# entityId>0 branch. This
+      // is the part that needs M.UploadConfiguration Read permission.
+      async function attachFileToAsset(assetId, img) {
+        const buffer = await img.entry.async('arraybuffer');
+        const blob = new Blob([buffer], { type: mimeFor(img.name) });
+        const file = (typeof File === 'function') ? new File([blob], img.name, { type: blob.type }) : blob;
+        return await client.uploads.uploadFileAsync(file, {
+          fileName: img.name, fileSize: blob.size,
+          uploadConfiguration: cfg.uploadConfiguration,
+          actionName: 'NewMainFile',
+          actionParameters: { AssetId: assetId }
+        });
       }
 
       // Link asset -> product. Always add to the all-assets relation; if the
@@ -624,15 +682,22 @@ export default function createExternalRoot(rootElement) {
               rec.resultNote = 'product ' + prod.id;
             } else {
               try {
-                const assetId = await uploadAsset(img);
+                // 1. Create the asset ENTITY (proven metadata write — no upload pipeline).
+                const assetId = await createAssetEntity(img);
+                // 2. Link to the product (all-assets + cover-if-empty).
                 const link = await linkAssetToProduct(assetId, prod.id);
-                let typeIdent;
-                try { typeIdent = await setAssetType(assetId, link.master); }
-                catch (te) { throw new Error(`linked but asset type not set: ${te.message}`); }
+                // 3. Set asset type (+ lifecycle).
+                const typeIdent = await setAssetType(assetId, link.master);
                 const shortType = String(typeIdent).replace(/^M\.AssetType\./, '');
+                // 4. Attach the binary file (separate upload pipeline — best effort).
+                let fileNote = '';
+                if (cfg.attachFile) {
+                  try { await attachFileToAsset(assetId, img); fileNote = ', file attached'; }
+                  catch (fe) { fileNote = `, ⚠ file NOT attached (${errDetail(fe)})`; }
+                }
                 rec.ok = true; rec.statusLabel = link.master ? 'Linked + cover' : 'Linked';
                 rec.productId = prod.id; rec.productName = prod.name;
-                rec.resultNote = `asset ${assetId} → product ${prod.id}${link.master ? ' (cover)' : ''}, type ${shortType}`;
+                rec.resultNote = `asset ${assetId} → product ${prod.id}${link.master ? ' (cover)' : ''}, type ${shortType}${fileNote}`;
               } catch (e) {
                 rec.statusLabel = 'Write error'; rec.message = (e && e.message) ? e.message : String(e);
               }
