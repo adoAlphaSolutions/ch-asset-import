@@ -48,7 +48,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v2.7 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v2.8 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -155,6 +155,46 @@ function findCtor(names) {
   const scopes = [typeof window !== 'undefined' ? window : null, typeof globalThis !== 'undefined' ? globalThis : null];
   for (const sc of scopes) { if (!sc) continue; for (const n of names) { if (typeof sc[n] === 'function') return sc[n]; } }
   return null;
+}
+
+// ---- REST relation helpers (bypass SDK lazy-load option classes) -----------
+// The relation endpoint /api/entities/{id}/relations/{name} supports GET and PUT.
+// A PUT replaces the relation's parents/children, so we read, append, and write.
+function entHref(id) { return `${CH_HOST}/api/entities/${id}`; }
+function relHrefList(arr) {
+  return Array.isArray(arr) ? arr.map(c => ({ href: (c && c.href) ? c.href : (typeof c === 'number' ? entHref(c) : String(c)) })) : [];
+}
+function hrefHasId(list, id) {
+  return (list || []).some(c => { const h = (c && c.href) ? c.href : String(c); return new RegExp('/' + id + '(?:$|[/?#])').test(h); });
+}
+async function restGetRelation(entityId, name) {
+  const res = await fetch(`${CH_HOST}/api/entities/${entityId}/relations/${encodeURIComponent(name)}`, { credentials: 'include', headers: { Accept: 'application/json' } });
+  if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`GET relation ${name} HTTP ${res.status}${t ? ' — ' + t.slice(0, 160) : ''}`); }
+  return await res.json();
+}
+async function restPutRelation(entityId, name, body) {
+  const res = await fetch(`${CH_HOST}/api/entities/${entityId}/relations/${encodeURIComponent(name)}`, {
+    method: 'PUT', credentials: 'include',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`PUT relation ${name} HTTP ${res.status}${t ? ' — ' + t.slice(0, 200) : ''}`); }
+  return true;
+}
+// Add a child to a parent-side relation (product -> assets). Skips duplicates.
+async function restAddChild(parentId, name, childId) {
+  const rel = await restGetRelation(parentId, name);
+  const children = relHrefList(rel.children);
+  if (!hrefHasId(children, childId)) children.push({ href: entHref(childId) });
+  await restPutRelation(parentId, name, { children });
+}
+async function restChildCount(parentId, name) {
+  const rel = await restGetRelation(parentId, name);
+  return Array.isArray(rel.children) ? rel.children.length : 0;
+}
+// Set the single parent of a child-side relation (asset -> AssetType / lifecycle).
+async function restSetParent(childId, name, parentId) {
+  await restPutRelation(childId, name, { parents: [{ href: entHref(parentId) }] });
 }
 
 function safeJson(v) { try { return JSON.stringify(v).slice(0, 240); } catch (e) { return String(v); } }
@@ -551,19 +591,15 @@ export default function createExternalRoot(rootElement) {
       async function setAssetType(assetId, isCover) {
         const identifier = isCover ? cfg.coverAssetType : cfg.stockAssetType;
         const typeId = await assetTypeId(identifier);
-        const asset = await client.entities.getAsync(assetId);
-        const rel = await getRel(asset, cfg.assetTypeRelation);
-        if (!rel) throw new Error(`relation ${cfg.assetTypeRelation} not found on asset`);
-        relSetIds(rel, [typeId]);   // single type; replace rather than append
+        // AssetTypeToAsset: asset is CHILD of M.AssetType -> set the single parent.
+        await restSetParent(assetId, cfg.assetTypeRelation, typeId);
 
         if (cfg.setLifecycle && cfg.lifecycleStatus) {
           try {
-            const lc = await getRel(asset, cfg.lifecycleRelation);
-            if (lc && typeof lc.setIdentifiersAsync === 'function') await lc.setIdentifiersAsync([cfg.lifecycleStatus]);
-            else if (lc) { const st = await client.entities.getAsync(cfg.lifecycleStatus); if (st && st.id != null) relSetIds(lc, [st.id]); }
+            const lcId = await assetTypeId(cfg.lifecycleStatus);   // resolves identifier -> id (cached)
+            await restSetParent(assetId, cfg.lifecycleRelation, lcId);
           } catch (e) { /* lifecycle is best-effort */ }
         }
-        await client.entities.saveAsync(asset);
         return identifier;
       }
 
@@ -586,21 +622,15 @@ export default function createExternalRoot(rootElement) {
       // product has no master/cover yet, also set this asset as the cover.
       // Returns { master: true } when the asset was set as the cover.
       async function linkAssetToProduct(assetId, productId) {
-        const product = await client.entities.getAsync(productId);
+        // 1) all-assets (product is parent, asset is child) — REST add, skips dups
+        await restAddChild(productId, cfg.allAssetsRelation, assetId);
 
-        // 1) all-assets (product is parent, asset is child) — skip if already present
-        const all = await getRel(product, cfg.allAssetsRelation);
-        if (!all) throw new Error(`relation ${cfg.allAssetsRelation} not found on product`);
-        if (relGetIds(all).indexOf(assetId) < 0) relAdd(all, assetId);
-
-        // 2) master/cover — only if empty (single asset allowed)
+        // 2) master/cover — only if the product has none yet (single asset)
         let master = false;
         if (cfg.setMasterIfEmpty) {
-          const cover = await getRel(product, cfg.masterAssetRelation);
-          if (cover && relGetIds(cover).length === 0) { relAdd(cover, assetId); master = true; }
+          const cnt = await restChildCount(productId, cfg.masterAssetRelation);
+          if (cnt === 0) { await restAddChild(productId, cfg.masterAssetRelation, assetId); master = true; }
         }
-
-        await client.entities.saveAsync(product);
         return { master };
       }
 
