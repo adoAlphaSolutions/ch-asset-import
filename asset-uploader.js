@@ -48,7 +48,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v3.2 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v3.3 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -265,7 +265,7 @@ function errDetail(e) {
       }
     }
   } catch (_) { /* ignore */ }
-  for (const k of ['parameterName', 'argumentName', 'paramName', 'name', 'errors', 'validationErrors', 'messages', 'detail', 'title', 'body', 'responseText', 'data', 'error', 'innerException']) {
+  for (const k of ['parameterName', 'argumentName', 'paramName', 'name', 'failures', 'errors', 'validationErrors', 'messages', 'detail', 'title', 'body', 'responseText', 'data', 'error', 'innerException']) {
     try { if (e[k] != null) parts.push(`${k}=${typeof e[k] === 'object' ? safeJson(e[k]) : String(e[k]).slice(0, 300)}`); } catch (_) { /* ignore */ }
   }
   try { if (typeof e.getErrors === 'function') { const ge = e.getErrors(); if (ge) parts.push(`getErrors=${safeJson(ge)}`); } } catch (_) { /* ignore */ }
