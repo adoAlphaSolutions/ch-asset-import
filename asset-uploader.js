@@ -48,7 +48,7 @@
 //   }
 // ============================================================================
 
-const BUILD_VERSION = 'v2.8 · 2026-08-26';   // bump on every change; shown in the footer
+const BUILD_VERSION = 'v2.9 · 2026-08-26';   // bump on every change; shown in the footer
 const CH_HOST = window.location.origin;
 const JSZIP_URL = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
@@ -159,42 +159,69 @@ function findCtor(names) {
 
 // ---- REST relation helpers (bypass SDK lazy-load option classes) -----------
 // The relation endpoint /api/entities/{id}/relations/{name} supports GET and PUT.
-// A PUT replaces the relation's parents/children, so we read, append, and write.
+// We read the current members, append/replace, and PUT — trying the body shapes
+// Content Hub accepts (hrefs / ids / {id} objects) until one works.
 function entHref(id) { return `${CH_HOST}/api/entities/${id}`; }
-function relHrefList(arr) {
-  return Array.isArray(arr) ? arr.map(c => ({ href: (c && c.href) ? c.href : (typeof c === 'number' ? entHref(c) : String(c)) })) : [];
+function memberIds(arr) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const c of arr) {
+    if (c == null) continue;
+    if (typeof c === 'number') { out.push(c); continue; }
+    if (c.id != null) { out.push(Number(c.id)); continue; }
+    const h = c.href || (c.self && c.self.href) || (typeof c === 'string' ? c : '');
+    const m = String(h).match(/(\d+)(?:[/?#].*)?$/);
+    if (m) out.push(Number(m[1]));
+  }
+  return out;
 }
-function hrefHasId(list, id) {
-  return (list || []).some(c => { const h = (c && c.href) ? c.href : String(c); return new RegExp('/' + id + '(?:$|[/?#])').test(h); });
-}
+let relPutOkLabel = '';   // which PUT body shape works on this instance (log once)
 async function restGetRelation(entityId, name) {
   const res = await fetch(`${CH_HOST}/api/entities/${entityId}/relations/${encodeURIComponent(name)}`, { credentials: 'include', headers: { Accept: 'application/json' } });
   if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`GET relation ${name} HTTP ${res.status}${t ? ' — ' + t.slice(0, 160) : ''}`); }
   return await res.json();
 }
-async function restPutRelation(entityId, name, body) {
+async function restRawPut(entityId, name, body) {
   const res = await fetch(`${CH_HOST}/api/entities/${entityId}/relations/${encodeURIComponent(name)}`, {
     method: 'PUT', credentials: 'include',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify(body)
   });
-  if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`PUT relation ${name} HTTP ${res.status}${t ? ' — ' + t.slice(0, 200) : ''}`); }
+  if (!res.ok) { const t = await res.text().catch(() => ''); throw new Error(`HTTP ${res.status}${t ? ' — ' + t.slice(0, 160) : ''}`); }
   return true;
 }
+// PUT a relation side ('children' or 'parents') with the given ids, trying the
+// body shapes CH may accept. `dbg` (optional) logs the GET shape + winning form.
+async function restSetMembers(entityId, name, side, ids, dbg) {
+  const variants = [
+    [`${side}:hrefs`, { [side]: ids.map(id => ({ href: entHref(id) })) }],
+    [`${side}:ids`, { [side]: ids.slice() }],
+    [`${side}:id-objs`, { [side]: ids.map(id => ({ id })) }],
+    [`${side}:self-hrefs`, { [side]: ids.map(id => ({ self: { href: entHref(id) } })) }]
+  ];
+  const errs = [];
+  for (const [label, body] of variants) {
+    try { await restRawPut(entityId, name, body); if (dbg && relPutOkLabel !== label) { relPutOkLabel = label; dbg(`relation PUT format that works: ${label}`, 'a-ok'); } return; }
+    catch (e) { errs.push(`${label}→${e.message}`); }
+  }
+  throw new Error(`PUT relation ${name} failed all formats: ${errs.join(' | ')}`);
+}
 // Add a child to a parent-side relation (product -> assets). Skips duplicates.
-async function restAddChild(parentId, name, childId) {
+async function restAddChild(parentId, name, childId, dbg) {
   const rel = await restGetRelation(parentId, name);
-  const children = relHrefList(rel.children);
-  if (!hrefHasId(children, childId)) children.push({ href: entHref(childId) });
-  await restPutRelation(parentId, name, { children });
+  if (dbg) dbg(`GET ${name}: ${JSON.stringify(rel).slice(0, 500)}`, 'a-info');
+  const ids = memberIds(rel.children);
+  if (ids.indexOf(Number(childId)) >= 0) return;
+  ids.push(Number(childId));
+  await restSetMembers(parentId, name, 'children', ids, dbg);
 }
 async function restChildCount(parentId, name) {
   const rel = await restGetRelation(parentId, name);
-  return Array.isArray(rel.children) ? rel.children.length : 0;
+  return memberIds(rel.children).length;
 }
 // Set the single parent of a child-side relation (asset -> AssetType / lifecycle).
-async function restSetParent(childId, name, parentId) {
-  await restPutRelation(childId, name, { parents: [{ href: entHref(parentId) }] });
+async function restSetParent(childId, name, parentId, dbg) {
+  await restSetMembers(childId, name, 'parents', [Number(parentId)], dbg);
 }
 
 function safeJson(v) { try { return JSON.stringify(v).slice(0, 240); } catch (e) { return String(v); } }
@@ -592,12 +619,12 @@ export default function createExternalRoot(rootElement) {
         const identifier = isCover ? cfg.coverAssetType : cfg.stockAssetType;
         const typeId = await assetTypeId(identifier);
         // AssetTypeToAsset: asset is CHILD of M.AssetType -> set the single parent.
-        await restSetParent(assetId, cfg.assetTypeRelation, typeId);
+        await restSetParent(assetId, cfg.assetTypeRelation, typeId, log);
 
         if (cfg.setLifecycle && cfg.lifecycleStatus) {
           try {
             const lcId = await assetTypeId(cfg.lifecycleStatus);   // resolves identifier -> id (cached)
-            await restSetParent(assetId, cfg.lifecycleRelation, lcId);
+            await restSetParent(assetId, cfg.lifecycleRelation, lcId, log);
           } catch (e) { /* lifecycle is best-effort */ }
         }
         return identifier;
@@ -623,13 +650,13 @@ export default function createExternalRoot(rootElement) {
       // Returns { master: true } when the asset was set as the cover.
       async function linkAssetToProduct(assetId, productId) {
         // 1) all-assets (product is parent, asset is child) — REST add, skips dups
-        await restAddChild(productId, cfg.allAssetsRelation, assetId);
+        await restAddChild(productId, cfg.allAssetsRelation, assetId, log);
 
         // 2) master/cover — only if the product has none yet (single asset)
         let master = false;
         if (cfg.setMasterIfEmpty) {
           const cnt = await restChildCount(productId, cfg.masterAssetRelation);
-          if (cnt === 0) { await restAddChild(productId, cfg.masterAssetRelation, assetId); master = true; }
+          if (cnt === 0) { await restAddChild(productId, cfg.masterAssetRelation, assetId, log); master = true; }
         }
         return { master };
       }
